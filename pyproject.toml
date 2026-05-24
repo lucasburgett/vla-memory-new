@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vla-memory-new"
+version = "0.1.0"
+description = "GRPO-trained memory VLM for hierarchical VLA long-horizon manipulation"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.45",
+    "qwen-vl-utils>=0.0.8",
+    "jsonschema>=4.0",
+    "numpy>=1.24",
+    "Pillow>=10.0",
+    "pyyaml>=6.0",
+    "modal>=0.73",
+    # Required locally by modal.Secret.from_dotenv() in modal_server.py;
+    # parsed on the user's machine at `modal run` time, not in the container.
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

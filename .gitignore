@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+*.so
+
+.env
+.venv/
+venv/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.db
+results.db
+
+# Local agent overrides (not committed)
+CLAUDE.local.md
+AGENTS.local.md
+
+# Modal / HF caches (local)
+.cache/
+checkpoints/
+wandb/
+
+# Submodule data/run dirs (never commit)
+robomme_policy_learning/data/
+robomme_policy_learning/runs/
+
+# OS
+.DS_Store
+
+# Evaluation results (generated outputs)
+eval_results/

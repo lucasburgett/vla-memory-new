@@ -10,8 +10,14 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.0",
-    "transformers>=4.45",
+    "torch>=2.4",
+    # Upper bound is set by ms-swift 3.x, which requires transformers<4.58.
+    # Qwen3VLForConditionalGeneration is available across the entire allowed
+    # range (added in the 4.5x series); a `>=5.0` pin would resolve-fail
+    # against ms-swift 3.x.
+    "transformers>=4.49",
+    "peft>=0.13",
+    "accelerate>=1.2",
     "qwen-vl-utils>=0.0.8",
     "jsonschema>=4.0",
     "numpy>=1.24",
@@ -27,6 +33,19 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
+]
+# Heavy training stack — only installed inside the Modal container, never on
+# the dev machine. ms-swift + flash-attn require CUDA at build time.
+train = [
+    # ms-swift 4.x dropped/renamed several CLI flags upstream's recipe uses
+    # (e.g. --train_type lora). Stay on 3.x; see modal_train.py pip_install.
+    "ms-swift>=3.0,<4.0",
+    "imageio>=2.34",
+    "imageio-ffmpeg>=0.5",
+    "wandb>=0.19",
+    # deepspeed intentionally NOT listed — see modal_train.py pip_install
+    # comment. LoRA on 4× A100-80GB doesn't need ZeRO; deepspeed 0.19's
+    # import-time nvcc check fails on cudnn-runtime base images.
 ]
 
 [tool.setuptools.packages.find]

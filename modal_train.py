@@ -642,7 +642,7 @@ def sft_warmstart(
         # torchrun + DDP is the fallback and is sufficient for LoRA.
         "--dataset_num_proc", "4",
         "--dataloader_num_workers", "4",
-        "--report_to", "wandb",
+        "--report_to", "wandb" if os.environ.get("WANDB_API_KEY") else "none",
         "--run_name", run_name,
     ]
 

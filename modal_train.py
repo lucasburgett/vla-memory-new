@@ -1287,6 +1287,162 @@ def rloo(
 
 
 # ---------------------------------------------------------------------------
+# Stage D — Evaluate a trained PPO (or GRPO) Qwen adapter on ButtonUnmask val
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=2 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def evaluate(
+    adapter_path: str = f"{MOUNT}/runs/ppo/buttonunmask_50steps/step50",
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    task: str = "ButtonUnmask",
+    n_episodes: int = 50,
+    dataset: str = "val",
+    subgoal_type: str = "grounded_subgoal",
+    n_key_frames: int = 4,
+    n_recent_frames: int = 2,
+    reveal_window: int = 64,
+    decision_warm_cap: int = 150,
+    rollout_max_steps: int = 100,
+    seed: int = 0,
+) -> dict:
+    """Evaluate a trained Qwen adapter on ButtonUnmask val episodes.
+
+    Runs greedy subgoal decoding (no sampling) through the full hierarchy:
+    Qwen → grounded subgoal → GroundSG π0.5 → ManiSkill.
+    Reports task success rate and mean progress across n_episodes.
+    """
+    import json as _json
+
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting GroundSG π0.5 server on localhost:{port} …", flush=True)
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}", f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app", env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("π0.5 server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("π0.5 server is up.", flush=True)
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("π0.5 server did not become reachable")
+
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    eval_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+    }
+
+    eval_script = f"""
+import sys
+sys.path.insert(0, "/workspace/src")
+sys.path.insert(0, "/app/examples/robomme")
+
+import json, torch
+from vla_memory.qwen_subgoal.model import QwenSubgoalPolicy
+from vla_memory.grpo.env_runner import EnvRunner
+from vla_memory.grpo.reward import RewardConfig, compute_reward
+from vla_memory.grpo.rollout import RolloutWorker
+from openpi_client import websocket_client_policy as _wp
+
+policy = QwenSubgoalPolicy(
+    adapter_init_path="{adapter_path}",
+    torch_dtype=torch.bfloat16,
+    device="cuda",
+)
+reward_cfg = RewardConfig()
+results = []
+for ep in range({n_episodes}):
+    env_runner = EnvRunner(
+        env_id="{task}", video_save_dir="/tmp/eval_videos",
+        max_steps={rollout_max_steps}, dataset="{dataset}",
+    )
+    client = _wp.MMEVLAWebsocketClientPolicy("127.0.0.1", {port})
+    worker = RolloutWorker(
+        env_runner=env_runner, policy_client=client,
+        obs_horizon=16, max_steps={rollout_max_steps},
+        use_history=False, subgoal_type="{subgoal_type}",
+        decision_warm_cap={decision_warm_cap},
+        n_key_frames={n_key_frames}, n_recent_frames={n_recent_frames},
+        reveal_window={reveal_window}, n_candidate_frames=12,
+    )
+    try:
+        dp = worker.peek_at_decision_point(ep, seed={seed})
+        text, _ = policy.greedy_subgoal(
+            key_frames=dp.key_frames, recent_frames=dp.recent_frames,
+            task_goal=dp.task_goal, history_subgoals=dp.history_subgoals,
+        )
+        from vla_memory.qwen_subgoal.prompts import parse_subgoal_output
+        subtask, _ = parse_subgoal_output(text)
+        result = worker.rollout(episode_id=ep, sampled_subgoal=subtask, seed={seed})
+        reward = compute_reward(result.success_flag, result.progress, reward_cfg)
+        results.append({{"ep": ep, "subtask": subtask, "reward": reward,
+                         "success": result.success_flag, "progress": result.progress}})
+        print(f"ep={{ep:02d}} reward={{reward:.3f}} success={{result.success_flag}} subtask={{subtask[:60]!r}}", flush=True)
+    except Exception as e:
+        print(f"ep={{ep:02d}} ERROR: {{e!r}}", flush=True)
+        results.append({{"ep": ep, "error": repr(e), "reward": 0.0}})
+    finally:
+        worker.close()
+
+successes = sum(1 for r in results if r.get("success") == "success")
+mean_reward = sum(r.get("reward", 0) for r in results) / len(results)
+print(json.dumps({{"n_episodes": len(results), "successes": successes,
+                   "success_rate": successes/len(results), "mean_reward": mean_reward,
+                   "results": results}}))
+"""
+    out_path = f"{MOUNT}/runs/eval_{task}_{dataset}_{Path(adapter_path).name}.json"
+    try:
+        proc = subprocess.run(
+            ["micromamba", "run", "-n", "robomme", "python", "-u", "-c", eval_script],
+            env=eval_env, cwd="/workspace", capture_output=False,
+            text=True, timeout=7200,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"Eval script exited {proc.returncode}")
+    finally:
+        try:
+            volume.commit()
+        except Exception as e:
+            print(f"[eval] volume.commit() failed: {e!r}", flush=True)
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+    return {"output": out_path, "task": task, "dataset": dataset, "adapter": adapter_path}
+
+
+# ---------------------------------------------------------------------------
 # Stage C — Full pipeline (build_memory → sft → ppo), run detached
 #
 # Usage:
@@ -1535,5 +1691,7 @@ def main(stage: str = "grpo"):
         print(rloo.remote())
     elif stage == "pipeline":
         print(pipeline.remote())
+    elif stage == "evaluate":
+        print(evaluate.remote())
     else:
         raise SystemExit(f"unknown stage: {stage}")

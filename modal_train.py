@@ -1299,44 +1299,201 @@ def rloo(
 
 @app.function(
     image=image,
-    cpu=2.0,
-    memory=4 * 1024,
+    gpu="A100-80GB",
     timeout=24 * 3600,
     volumes={MOUNT: volume},
     secrets=[modal.Secret.from_dotenv(__file__)],
 )
 def pipeline(
     raw_data_path: str = f"{MOUNT}/data/robomme_data_h5",
+    sft_output_dir: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    ppo_output_dir: str = f"{MOUNT}/runs/ppo/buttonunmask_groundsg_v0",
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
     only_tasks: str = "ButtonUnmask",
+    num_sft_epochs: int = 5,
+    num_ppo_steps: int = 200,
     seed: int = 0,
 ) -> dict:
-    """Chain build_memory → sft_warmstart → ppo in one detachable Modal job.
+    """build_memory → sft → ppo in ONE Modal function — safe to run with --detach.
 
-    All three stages run sequentially on Modal's infra. Launch with::
+    Runs everything inline (no sub-.remote() calls) so a single A100-80GB
+    container handles the full pipeline. Close your laptop after launching::
 
         modal run --detach modal_train.py --stage pipeline
 
-    then close your laptop. Poll progress with::
+    Check progress::
 
         modal app logs <app-id> --follow
     """
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    Path(hf_cache_dir).mkdir(parents=True, exist_ok=True)
+    base_env = {
+        **os.environ,
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "IMAGE_MAX_TOKEN_NUM": "256",
+        "VIDEO_MAX_TOKEN_NUM": "64",
+        "FPS_MAX_FRAMES": "10",
+    }
+
+    # ------------------------------------------------------------------
+    # Stage 1: build_memory_dataset (CPU — Python in-process)
+    # ------------------------------------------------------------------
     print("[pipeline] Stage 1/3: build_memory_dataset", flush=True)
-    memory_paths = build_memory_dataset.remote(
-        raw_data_path=raw_data_path,
-        only_tasks=only_tasks,
-        seed=seed,
-    )
-    print(f"[pipeline] build_memory done: {memory_paths}", flush=True)
+    jsonl_path = f"{MOUNT}/data/preprocessed/memory/grounded_subgoal_train.jsonl"
+    if Path(jsonl_path).exists():
+        print(f"[pipeline] dataset already exists at {jsonl_path}, skipping build", flush=True)
+        memory_paths = {"grounded_subgoal_train": jsonl_path}
+    else:
+        from vla_memory.data.build_memory_sft_dataset import build_memory_sft_dataset
+        memory_paths = build_memory_sft_dataset(
+            raw_data_path=raw_data_path,
+            preprocessed_data_path=f"{MOUNT}/data/preprocessed",
+            only_tasks=tuple(t for t in only_tasks.split(",") if t),
+            seed=seed,
+        )
+        volume.commit()
+    print(f"[pipeline] Stage 1 done: {memory_paths}", flush=True)
 
+    # ------------------------------------------------------------------
+    # Stage 2: SFT warmstart (GPU — swift subprocess)
+    # ------------------------------------------------------------------
     print("[pipeline] Stage 2/3: sft_warmstart", flush=True)
-    sft_result = sft_warmstart.remote()
-    print(f"[pipeline] sft done: {sft_result}", flush=True)
+    run_name = f"qwen-sft-memory-{int(time.time())}"
+    sft_env = {
+        **base_env,
+        "NPROC_PER_NODE": "1",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "vla-memory-sft"),
+        "WANDB_RUN_NAME": run_name,
+    }
+    sft_cmd = [
+        "swift", "sft",
+        "--model", "Qwen/Qwen3-VL-4B-Instruct",
+        "--use_hf", "true",
+        "--dataset", jsonl_path,
+        "--split_dataset_ratio", "0.05",
+        "--load_from_cache_file", "true",
+        "--packing", "false",
+        "--train_type", "lora",
+        "--torch_dtype", "bfloat16",
+        "--num_train_epochs", str(num_sft_epochs),
+        "--per_device_train_batch_size", "8",
+        "--gradient_accumulation_steps", "1",
+        "--attn_impl", "sdpa",
+        "--padding_free", "false",
+        "--learning_rate", "4e-6",
+        "--lora_rank", "8",
+        "--lora_alpha", "16",
+        "--lora_dropout", "0.1",
+        "--target_modules", "all-linear",
+        "--freeze_vit", "true",
+        "--freeze_aligner", "true",
+        "--gradient_checkpointing", "true",
+        "--vit_gradient_checkpointing", "false",
+        "--save_steps", "25",
+        "--save_total_limit", "20",
+        "--eval_steps", "25",
+        "--eval_strategy", "steps",
+        "--logging_steps", "10",
+        "--max_length", "4096",
+        "--output_dir", sft_output_dir,
+        "--warmup_ratio", "0.05",
+        "--average_tokens_across_devices", "true",
+        "--max_grad_norm", "0.5",
+        "--label_smoothing_factor", "0.0",
+        "--dataset_num_proc", "4",
+        "--dataloader_num_workers", "4",
+        "--report_to", "wandb" if os.environ.get("WANDB_API_KEY") else "none",
+        "--run_name", run_name,
+    ]
+    print("Running SFT:", " ".join(sft_cmd[:6]) + " ...", flush=True)
+    try:
+        subprocess.run(sft_cmd, check=True, env=sft_env, cwd="/workspace")
+    finally:
+        volume.commit()
 
+    # Resolve latest checkpoint
+    versioned_runs = sorted(Path(sft_output_dir).glob("v*-*"))
+    if not versioned_runs:
+        raise RuntimeError(f"No versioned SFT run under {sft_output_dir}")
+    checkpoints = list(versioned_runs[-1].glob("checkpoint-*"))
+    if not checkpoints:
+        raise RuntimeError(f"No checkpoint under {versioned_runs[-1]}")
+    sft_adapter = str(max(checkpoints, key=lambda p: int(p.name.split("-", 1)[1])))
+    print(f"[pipeline] Stage 2 done: {sft_adapter}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Stage 3: PPO (GPU — π0.5 server + micromamba PPO loop)
+    # ------------------------------------------------------------------
     print("[pipeline] Stage 3/3: ppo", flush=True)
-    ppo_result = ppo.remote(seed=seed)
-    print(f"[pipeline] ppo done: {ppo_result}", flush=True)
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting π0.5 server on localhost:{port} …", flush=True)
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}", f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app", env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("π0.5 server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("π0.5 server is up.", flush=True)
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("π0.5 server did not become reachable")
 
-    return {"memory": memory_paths, "sft": sft_result, "ppo": ppo_result}
+    ppo_env = {
+        **base_env,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "vla-memory-ppo"),
+        "WANDB_RUN_NAME": f"qwen-ppo-{int(time.time())}",
+    }
+    ppo_cmd = [
+        "micromamba", "run", "-n", "robomme",
+        "python", "-u", "/workspace/src/vla_memory/ppo/main.py",
+        f"--port={port}",
+        f"--sft-adapter-path={sft_adapter}",
+        f"--output-dir={ppo_output_dir}",
+        f"--num-steps={num_ppo_steps}",
+        "--batch-states=4", "--rollouts-per-state=8",
+        "--only-tasks=ButtonUnmask", "--episodes-per-task=20",
+        "--subgoal-type=grounded_subgoal",
+        f"--seed={seed}",
+    ]
+    try:
+        subprocess.run(ppo_cmd, check=True, env=ppo_env, cwd="/workspace")
+    finally:
+        try:
+            volume.commit()
+        except Exception as e:
+            print(f"[pipeline] volume.commit() failed: {e!r}", flush=True)
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+    print(f"[pipeline] Stage 3 done: {ppo_output_dir}", flush=True)
+    return {"sft_adapter": sft_adapter, "ppo_output_dir": ppo_output_dir}
 
 
 # ---------------------------------------------------------------------------

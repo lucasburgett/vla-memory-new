@@ -1287,6 +1287,59 @@ def rloo(
 
 
 # ---------------------------------------------------------------------------
+# Stage C — Full pipeline (build_memory → sft → ppo), run detached
+#
+# Usage:
+#   modal run --detach modal_train.py --stage pipeline
+#
+# Runs all three stages in sequence inside Modal — no local process needed.
+# Safe to close your laptop after launching. Check progress with:
+#   modal app logs <app-id> --follow
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    cpu=2.0,
+    memory=4 * 1024,
+    timeout=24 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def pipeline(
+    raw_data_path: str = f"{MOUNT}/data/robomme_data_h5",
+    only_tasks: str = "ButtonUnmask",
+    seed: int = 0,
+) -> dict:
+    """Chain build_memory → sft_warmstart → ppo in one detachable Modal job.
+
+    All three stages run sequentially on Modal's infra. Launch with::
+
+        modal run --detach modal_train.py --stage pipeline
+
+    then close your laptop. Poll progress with::
+
+        modal app logs <app-id> --follow
+    """
+    print("[pipeline] Stage 1/3: build_memory_dataset", flush=True)
+    memory_paths = build_memory_dataset.remote(
+        raw_data_path=raw_data_path,
+        only_tasks=only_tasks,
+        seed=seed,
+    )
+    print(f"[pipeline] build_memory done: {memory_paths}", flush=True)
+
+    print("[pipeline] Stage 2/3: sft_warmstart", flush=True)
+    sft_result = sft_warmstart.remote()
+    print(f"[pipeline] sft done: {sft_result}", flush=True)
+
+    print("[pipeline] Stage 3/3: ppo", flush=True)
+    ppo_result = ppo.remote(seed=seed)
+    print(f"[pipeline] ppo done: {ppo_result}", flush=True)
+
+    return {"memory": memory_paths, "sft": sft_result, "ppo": ppo_result}
+
+
+# ---------------------------------------------------------------------------
 # Local entrypoint convenience
 # ---------------------------------------------------------------------------
 
@@ -1303,6 +1356,7 @@ def main(stage: str = "grpo"):
         modal run modal_train.py --stage grpo             # GRPO fine-tune (Lucas)
         modal run modal_train.py --stage ppo              # PPO with learned value baseline
         modal run modal_train.py --stage rloo             # RLOO ablation (leave-one-out advantage)
+        modal run --detach modal_train.py --stage pipeline  # build_memory+sft+ppo, lid-safe
     """
     if stage == "download_data":
         print(download_demonstrations.remote())
@@ -1322,5 +1376,7 @@ def main(stage: str = "grpo"):
         print(ppo.remote())
     elif stage == "rloo":
         print(rloo.remote())
+    elif stage == "pipeline":
+        print(pipeline.remote())
     else:
         raise SystemExit(f"unknown stage: {stage}")

@@ -7,6 +7,16 @@ directly when you need it::
     from vla_memory.qwen_subgoal.model import QwenSubgoalPolicy
 """
 
-from .prompts import build_messages, build_user_prompt, SYSTEM_PROMPTS
+from .prompts import (
+    SUBGOAL_SYSTEM_PROMPT,
+    build_messages,
+    build_user_prompt,
+    parse_subgoal_output,
+)
 
-__all__ = ["build_messages", "build_user_prompt", "SYSTEM_PROMPTS"]
+__all__ = [
+    "SUBGOAL_SYSTEM_PROMPT",
+    "build_messages",
+    "build_user_prompt",
+    "parse_subgoal_output",
+]

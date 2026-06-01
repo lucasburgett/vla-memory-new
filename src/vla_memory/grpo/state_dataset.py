@@ -6,8 +6,12 @@ image arrays here because that would require running ManiSkill in a separate
 process and storing tens of GB of frames. Instead the trainer loads the image
 on demand by replaying the env to the requested frame_idx.
 
-For early-stage training, ``frame_idx`` is simply 0 (initial frame). Mid-episode
-states are a TODO once env state checkpointing is wired up in ``rollout.py``.
+The mid-episode decision point is no longer encoded here: ``rollout.py`` warms
+up with the oracle subgoal and stops at the subgoal *transition* (the moment the
+task switches to the memory-dependent step), so each ``(task, episode_id)`` maps
+to one post-occlusion decision automatically. ``frame_idx`` is retained for an
+optional future "explicit decision step" override but is unused by the current
+trainer.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from typing import List
 class StateSample:
     task_name: str
     episode_id: int
-    frame_idx: int = 0           # 0 = initial frame; >0 = mid-episode (TODO)
+    frame_idx: int = 0           # reserved; decision point is auto-detected in rollout.py
     has_video_demo: bool = False
 
 

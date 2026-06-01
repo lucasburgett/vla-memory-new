@@ -35,6 +35,11 @@ from .reward import RewardConfig, compute_reward
 from .rollout import RolloutResult, RolloutWorker
 from .state_dataset import StateDataset, StateSample
 
+# A trajectory is the list of VLM generations scored by ONE episode reward:
+# one-shot = [subtask]; joint select-then-use = [selection, use]. GRPO sums logp
+# over a trajectory's generations with the trajectory's shared advantage.
+Trajectory = List[SampleResult]
+
 
 @dataclasses.dataclass
 class GRPOConfig:
@@ -46,11 +51,17 @@ class GRPOConfig:
     grad_clip: float = 1.0
     sample_temperature: float = 1.0
     sample_top_p: float = 0.95
-    max_new_tokens: int = 64
+    max_new_tokens: int = 128          # MemER target is a JSON object, not a bare phrase
     rollout_max_steps: int = 200
     rollout_obs_horizon: int = 16
     subgoal_type: str = "simple_subgoal"
     use_history: bool = False
+    # --- joint keyframe-selection (JOINT_MEMORY_DESIGN.md) ---
+    joint_selection: bool = False          # select-then-use: SELECT call picks keyframes from the
+                                           # candidate window, USE call acts on ONLY those. Trains
+                                           # selection + subtask jointly. False = one-shot path.
+    n_candidate_frames: int = 12           # SELECT-call candidate window breadth
+    max_keyframes: int = 4                 # cap on kept keyframes the USE call sees
     # --- advantage / loss shaping ---
     normalize_advantage_std: bool = False  # Dr.GRPO: don't divide by group std (it amplifies
                                            # near-degenerate groups). Use Â = r - mean(r).
@@ -68,6 +79,8 @@ class GRPOConfig:
     save_every: int = 25
     output_dir: str = "runs/grpo"
     seed: int = 0
+    debug_subgoals: bool = False       # print each sampled subgoal's text + token
+                                       # count — confirms generations terminate.
 
 
 class GRPOTrainer:
@@ -168,12 +181,23 @@ class GRPOTrainer:
             # to a single zero-advantage group that contributes nothing; stepping
             # then is a wasted, misleading "trained" update.
             stepped = metrics["n_generated_tokens"] > 0
+            grad_norm = 0.0
             if stepped:
                 # Re-activate the trainable 'policy' adapter before clip/step: a
                 # KL reference forward leaves 'reference' active, and PEFT would
                 # then have grad-clip / the optimizer touch the frozen adapter.
                 self.policy.activate_policy()
-                torch.nn.utils.clip_grad_norm_(self.policy.trainable_parameters(), self.cfg.grad_clip)
+                # clip_grad_norm_ returns the total grad norm BEFORE clipping —
+                # capture it. This is THE diagnostic for "is the gradient
+                # vanishing": pg_loss is ~0 by construction (Σ advantage = 0
+                # within every group), so the loss value is NOT a gradient
+                # proxy. A grad_norm collapsing toward 0 confirms a dead/uninformative
+                # gradient; a healthy nonzero norm means the signal is the issue.
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        self.policy.trainable_parameters(), self.cfg.grad_clip
+                    )
+                )
                 self.optimizer.step()
             else:
                 print(
@@ -182,6 +206,7 @@ class GRPOTrainer:
                     flush=True,
                 )
             metrics["optimizer_stepped"] = int(stepped)
+            metrics["grad_norm"] = grad_norm
 
             dt = time.time() - t0
             flat = [r for grp in all_rewards for r in grp]
@@ -220,7 +245,7 @@ class GRPOTrainer:
 
     def _collect_groups(
         self, n_target: int, step: int
-    ) -> tuple[List[List[SampleResult]], List[List[float]], int, int]:
+    ) -> tuple[List[List[Trajectory]], List[List[float]], int, int]:
         """Roll out groups until ``n_target`` of them are non-degenerate.
 
         DAPO dynamic sampling: a group whose rewards are all equal has zero group
@@ -230,7 +255,7 @@ class GRPOTrainer:
         non-degenerate groups we have (or the last group if every attempt was
         degenerate — the caller then skips the optimizer step).
         """
-        groups: List[List[SampleResult]] = []
+        groups: List[List[Trajectory]] = []
         rewards: List[List[float]] = []
         n_dropped = 0
         attempts = 0
@@ -241,7 +266,10 @@ class GRPOTrainer:
             attempts += 1
             cands, grp_rewards, _ = self._rollout_group(state, step)
             last = (cands, grp_rewards)
-            degenerate = float(np.std(grp_rewards)) <= self.cfg.advantage_std_floor
+            degenerate = (
+                not grp_rewards
+                or float(np.std(grp_rewards)) <= self.cfg.advantage_std_floor
+            )
             if self.cfg.dynamic_sampling and degenerate:
                 n_dropped += 1
                 continue
@@ -258,63 +286,136 @@ class GRPOTrainer:
 
     def _rollout_group(
         self, state: StateSample, step: int
-    ) -> tuple[List[SampleResult], List[float], None]:
-        """Sample K subgoals for ``state`` and roll each out to a (dense) reward.
+    ) -> tuple[List[Trajectory], List[float], None]:
+        """Roll out a group for ``state`` → K TRAJECTORIES + their episode rewards.
 
-        Each subgoal is rolled out ``rollouts_per_subgoal`` times and the reward
-        averaged — the frozen pi0.5 is a stochastic flow policy, so a single
-        rollout is a noisy estimate of a subgoal's quality. All rollouts in the
-        group share one env seed (``seed_match_group``) so reward differences
-        track the subgoal rather than the scene.
+        Dispatches on ``cfg.joint_selection``: one-shot (one VLM call → subtask) or
+        joint select-then-use (SELECT call picks keyframes → USE call acts on only
+        those). All rollouts in the group share one env seed (``seed_match_group``),
+        so reward differences track the VLM output, not the scene.
         """
         worker = self.rollout_factory(state)
-        # One seed per (run seed, episode, step): all K candidates + their repeats
-        # in this group share a scene (within-group common-random-numbers), while
-        # the same episode drawn on a later step gets a fresh scene — avoids
-        # overfitting to one frozen layout per episode. None → upstream
-        # re-randomizes on every reset (no CRN).
+        # One seed per (run seed, episode, step): within-group common-random-numbers
+        # so the cube→container layout is identical across candidates; a later step
+        # on the same episode gets a fresh scene (avoids overfitting one layout).
         group_seed = None
         if self.cfg.seed_match_group:
             group_seed = ((self.cfg.seed * 1_000_003 + state.episode_id) * 9_973 + step) % 2_147_483_647
 
         try:
-            # peek_init constructs the env once and keeps it open across the K
-            # rollouts of this group — avoids paying the asset-loading cost
-            # K+1 times per state.
-            init_image, task_goal = worker.peek_init(state.episode_id, seed=group_seed)
+            # peek warms up with the oracle to the post-occlusion decision point and
+            # returns the reveal keyframes + recent context (+ the broad candidate
+            # window for joint selection). Each rollout below rebuilds the env from
+            # the same seed (cube layout matches) — see _ensure_env on why we rebuild.
+            dp = worker.peek_at_decision_point(state.episode_id, seed=group_seed)
+            if dp.terminated_early and self.cfg.debug_subgoals:
+                print(
+                    f"[grpo][debug] step={step} ep={state.episode_id} warm-up "
+                    f"terminated early ({dp.success_flag}) after {dp.warm_steps} "
+                    "steps — no memory decision; group should be degenerate.",
+                    flush=True,
+                )
+            if self.cfg.joint_selection:
+                trajectories, rewards = self._joint_group(dp, state, worker, group_seed, step)
+            else:
+                trajectories, rewards = self._oneshot_group(dp, state, worker, group_seed, step)
+        finally:
+            worker.close()
+        return trajectories, rewards, None
 
-            cands = self.policy.sample_subgoals(
-                image=init_image,
-                task_goal=task_goal,
-                history_subgoals=[],
-                k=self.cfg.group_size,
+    def _score_rollout(self, subtask: str, state: StateSample, worker, group_seed) -> float:
+        """Execute ``subtask`` on the low-level policy → dense reward.
+
+        Blank subtask → 0 without a rollout (π0.5 with no subgoal can't do better;
+        the negative advantage still trains the policy away from it). Averages
+        ``rollouts_per_subgoal`` trials to cut π0.5 flow-sampling noise.
+        """
+        if not subtask.strip():
+            return 0.0
+        trials: List[float] = []
+        for _ in range(max(1, self.cfg.rollouts_per_subgoal)):
+            result = worker.rollout(
+                episode_id=state.episode_id, sampled_subgoal=subtask, seed=group_seed,
+            )
+            trials.append(compute_reward(result.success_flag, result.progress, self.reward_cfg))
+        return float(np.mean(trials))
+
+    def _oneshot_group(self, dp, state, worker, group_seed, step) -> tuple[List[Trajectory], List[float]]:
+        """One VLM call → subtask; each candidate is its own length-1 trajectory."""
+        cands = self.policy.sample_subgoals(
+            key_frames=dp.key_frames,
+            recent_frames=dp.recent_frames,
+            task_goal=dp.task_goal,
+            history_subgoals=dp.history_subgoals,
+            k=self.cfg.group_size,
+            max_new_tokens=self.cfg.max_new_tokens,
+            temperature=self.cfg.sample_temperature,
+            top_p=self.cfg.sample_top_p,
+            has_video_demo=state.has_video_demo,
+            debug=self.cfg.debug_subgoals,
+        )
+        if self.cfg.debug_subgoals:
+            for ci, c in enumerate(cands):
+                print(
+                    f"[grpo][debug] step={step} ep={state.episode_id} cand={ci} "
+                    f"ntok={c.token_ids.numel()} subtask={c.subtask!r} kf={c.keyframe_positions}",
+                    flush=True,
+                )
+        rewards = [self._score_rollout(c.subtask, state, worker, group_seed) for c in cands]
+        return [[c] for c in cands], rewards
+
+    def _joint_group(self, dp, state, worker, group_seed, step) -> tuple[List[Trajectory], List[float]]:
+        """SELECT call (pick keyframes from the candidate window) → USE call (act on
+        ONLY the kept frames) → rollout. Trajectory = [selection, use]; both
+        generations are trained by the episode reward, so selection + subtask are
+        learned jointly (JOINT_MEMORY_DESIGN.md §3-4)."""
+        from .selection import apply_selection
+
+        sel_cands = self.policy.sample_subgoals(
+            key_frames=[],
+            recent_frames=dp.candidate_frames,
+            task_goal=dp.task_goal,
+            history_subgoals=[],   # SELECT call is "observe & select" — no completed-subtask
+                                   # line; matches the SELECT SFT rows (build_memory_sft_dataset).
+            k=self.cfg.group_size,
+            max_new_tokens=self.cfg.max_new_tokens,
+            temperature=self.cfg.sample_temperature,
+            top_p=self.cfg.sample_top_p,
+            has_video_demo=state.has_video_demo,
+            debug=self.cfg.debug_subgoals,
+        )
+        recent_base = [dp.current_frame] if dp.current_frame is not None else []
+        trajectories: List[Trajectory] = []
+        rewards: List[float] = []
+        for si, sel in enumerate(sel_cands):
+            kept = apply_selection(sel.keyframe_positions, dp.candidate_frames, self.cfg.max_keyframes)
+            if not kept and not recent_base:
+                # No frames to condition the USE call on (degenerate warm-up).
+                trajectories.append([sel])
+                rewards.append(0.0)
+                continue
+            use = self.policy.sample_subgoals(
+                key_frames=kept,
+                recent_frames=recent_base,
+                task_goal=dp.task_goal,
+                history_subgoals=dp.history_subgoals,
+                k=1,
                 max_new_tokens=self.cfg.max_new_tokens,
                 temperature=self.cfg.sample_temperature,
                 top_p=self.cfg.sample_top_p,
-                subgoal_type=self.cfg.subgoal_type,
                 has_video_demo=state.has_video_demo,
-            )
-
-            rewards: List[float] = []
-            for c in cands:
-                trials: List[float] = []
-                for _ in range(max(1, self.cfg.rollouts_per_subgoal)):
-                    result = worker.rollout(
-                        episode_id=state.episode_id,
-                        sampled_subgoal=c.text,
-                        seed=group_seed,
-                    )
-                    trials.append(
-                        compute_reward(
-                            status=result.success_flag,
-                            progress=result.progress,
-                            cfg=self.reward_cfg,
-                        )
-                    )
-                rewards.append(float(np.mean(trials)))
-        finally:
-            worker.close()
-        return cands, rewards, None
+                debug=self.cfg.debug_subgoals,
+            )[0]
+            if self.cfg.debug_subgoals:
+                print(
+                    f"[grpo][debug] step={step} ep={state.episode_id} sel={si} "
+                    f"kf={sel.keyframe_positions} kept={len(kept)}/{len(dp.candidate_frames)} "
+                    f"subtask={use.subtask!r}",
+                    flush=True,
+                )
+            rewards.append(self._score_rollout(use.subtask, state, worker, group_seed))
+            trajectories.append([sel, use])
+        return trajectories, rewards
 
     # ------------------------------------------------------------------
     # Loss — per-candidate backward to keep memory bounded.
@@ -322,7 +423,7 @@ class GRPOTrainer:
 
     def _accumulate_gradients(
         self,
-        groups: List[List[SampleResult]],
+        groups: List[List[Trajectory]],
         rewards: List[List[float]],
     ) -> dict:
         """GRPO objective applied one candidate at a time (bounded memory).
@@ -358,60 +459,28 @@ class GRPOTrainer:
             if self.cfg.normalize_advantage_std and r.std() > 1e-8:
                 adv = adv / (r.std() + 1e-8)
 
-            for cand_idx, cand in enumerate(group):
-                if cand.token_ids.numel() == 0:
-                    # Empty generation (EOS at position 0): logp over a (0,)
-                    # tensor is NaN and would poison every parameter. Skip it.
-                    print(f"[grpo] WARN: skipping empty subgoal candidate (idx={cand_idx})")
-                    continue
-
-                a = float(adv[cand_idx])
+            # One advantage per TRAJECTORY; every generation in it (one-shot:
+            # [subtask]; joint: [selection, use]) gets that advantage, so selection
+            # and subtask are trained jointly from one episode reward.
+            for traj_idx, traj in enumerate(group):
+                a = float(adv[traj_idx])
                 if a == 0.0 and not use_kl:
-                    # Zero advantage and no KL → zero gradient; skip the
-                    # forward/backward entirely to save compute.
+                    # Zero advantage and no KL → zero gradient for the whole
+                    # trajectory; skip the forward/backward to save compute.
                     continue
-
-                ref_logp = None
-                if use_kl:
-                    # Reference FIRST and under no_grad, so 'policy' is the
-                    # active (trainable) adapter at backward() below.
-                    with torch.no_grad():
-                        ref_logp = self.policy.policy_logprobs(
-                            prompt_input_ids=cand.prompt_input_ids,
-                            prompt_attention_mask=cand.prompt_attention_mask,
-                            gen_token_ids=cand.token_ids,
-                            pixel_values=cand.pixel_values,
-                            image_grid_thw=cand.image_grid_thw,
-                            adapter="reference",
-                            gradient_enabled=False,
-                        )
-
-                policy_logp = self.policy.policy_logprobs(
-                    prompt_input_ids=cand.prompt_input_ids,
-                    prompt_attention_mask=cand.prompt_attention_mask,
-                    gen_token_ids=cand.token_ids,
-                    pixel_values=cand.pixel_values,
-                    image_grid_thw=cand.image_grid_thw,
-                    adapter="policy",
-                    gradient_enabled=True,
-                )
-
-                pg_term = -a * policy_logp.sum() / token_norm * cand_scale
-                cand_loss = pg_term
-
-                if use_kl:
-                    # Quadratic per-token KL surrogate (leading-order of TRL's k3
-                    # estimator), constant-normalized like the PG term. policy_logp
-                    # carries gradient; ref_logp does not.
-                    kl_term = (policy_logp - ref_logp).pow(2).sum() / token_norm * cand_scale
-                    cand_loss = cand_loss + self.cfg.kl_beta * kl_term
-                    kl_val = float(kl_term.detach().cpu().item())
-                    kl_sum += kl_val
-                    per_group_kls.append(kl_val)
-
-                cand_loss.backward()
-                pg_sum += float(pg_term.detach().cpu().item())
-                n_tokens += int(policy_logp.shape[0])
+                for cand in traj:
+                    scored = self._score_generation(cand, a, use_kl, token_norm, cand_scale)
+                    if scored is None:
+                        # Empty generation (EOS at position 0): logp over a (0,)
+                        # tensor is NaN — skip it rather than poison every param.
+                        print(f"[grpo] WARN: skipping empty generation (traj={traj_idx})")
+                        continue
+                    pg_val, kl_val, n_tok = scored
+                    pg_sum += pg_val
+                    n_tokens += n_tok
+                    if use_kl:
+                        kl_sum += kl_val
+                        per_group_kls.append(kl_val)
 
         adv_abs: List[float] = []
         for grp_rewards in rewards:
@@ -426,6 +495,49 @@ class GRPOTrainer:
             "mean_per_group_kl": float(np.mean(per_group_kls)) if per_group_kls else 0.0,
             "mean_abs_advantage": float(np.mean(adv_abs)) if adv_abs else 0.0,
         }
+
+    def _score_generation(self, cand, a, use_kl, token_norm, cand_scale):
+        """Forward+backward ONE generation under advantage ``a`` (memory-bounded).
+
+        Returns ``(pg_val, kl_val, n_tokens)`` or ``None`` if the generation is
+        empty. KL ordering matters: the reference forward runs FIRST under no_grad
+        so the trainable 'policy' adapter is active at ``backward()`` — PEFT zeroes
+        grad on the non-active adapter (``feedback_peft_set_adapter_zeroes_grad``).
+        """
+        if cand.token_ids.numel() == 0:
+            return None
+        ref_logp = None
+        if use_kl:
+            with torch.no_grad():
+                ref_logp = self.policy.policy_logprobs(
+                    prompt_input_ids=cand.prompt_input_ids,
+                    prompt_attention_mask=cand.prompt_attention_mask,
+                    gen_token_ids=cand.token_ids,
+                    pixel_values=cand.pixel_values,
+                    image_grid_thw=cand.image_grid_thw,
+                    adapter="reference",
+                    gradient_enabled=False,
+                )
+        policy_logp = self.policy.policy_logprobs(
+            prompt_input_ids=cand.prompt_input_ids,
+            prompt_attention_mask=cand.prompt_attention_mask,
+            gen_token_ids=cand.token_ids,
+            pixel_values=cand.pixel_values,
+            image_grid_thw=cand.image_grid_thw,
+            adapter="policy",
+            gradient_enabled=True,
+        )
+        pg_term = -a * policy_logp.sum() / token_norm * cand_scale
+        loss = pg_term
+        kl_val = 0.0
+        if use_kl:
+            # Quadratic per-token KL surrogate (leading-order of TRL's k3
+            # estimator), constant-normalized like the PG term.
+            kl_term = (policy_logp - ref_logp).pow(2).sum() / token_norm * cand_scale
+            loss = loss + self.cfg.kl_beta * kl_term
+            kl_val = float(kl_term.detach().cpu().item())
+        loss.backward()
+        return float(pg_term.detach().cpu().item()), kl_val, int(policy_logp.shape[0])
 
     # ------------------------------------------------------------------
     # Persistence

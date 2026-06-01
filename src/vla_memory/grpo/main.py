@@ -50,10 +50,31 @@ def main() -> None:
     parser.add_argument("--seed-match-group", action=argparse.BooleanOptionalAction, default=True,
                         help="Pin the env reset seed across a group's rollouts (env-side CRN).")
     parser.add_argument("--rollout-max-steps", type=int, default=200)
-    parser.add_argument("--only-tasks", default="PickXtimes")
+    parser.add_argument("--only-tasks", default="ButtonUnmask",
+                        help="Permanence/spatial-memory task by default (was PickXtimes).")
     parser.add_argument("--episodes-per-task", type=int, default=20)
-    parser.add_argument("--subgoal-type", default="simple_subgoal")
+    parser.add_argument("--subgoal-type", default="grounded_subgoal",
+                        help="Memory lives in the grounding (which container) — GroundSG uses grounded.")
+    parser.add_argument("--n-key-frames", type=int, default=4,
+                        help="Reveal-window keyframes fed to the VLM as memory.")
+    parser.add_argument("--n-recent-frames", type=int, default=2,
+                        help="Recent execution frames (current context) fed to the VLM.")
+    parser.add_argument("--reveal-window", type=int, default=64,
+                        help="Steps over which the scene reveals (ButtonUnmask lifts/drops bins 0-64).")
+    parser.add_argument("--decision-warm-cap", type=int, default=150,
+                        help="Cap on oracle warm-up steps if no subgoal transition is detected.")
+    # --- joint keyframe-selection (JOINT_MEMORY_DESIGN.md) ---
+    parser.add_argument("--joint-selection", action=argparse.BooleanOptionalAction, default=False,
+                        help="Select-then-use: VLM picks keyframes from a candidate window, then "
+                             "acts on ONLY those. Trains selection + subtask jointly. Off = one-shot.")
+    parser.add_argument("--n-candidate-frames", type=int, default=12,
+                        help="SELECT-call candidate-window breadth (joint).")
+    parser.add_argument("--max-keyframes", type=int, default=4,
+                        help="Cap on kept keyframes the USE call sees (joint).")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--debug-subgoals", action="store_true",
+                        help="Print each sampled subgoal's text + token count — "
+                             "use to confirm generations terminate (v1 no-EOS check).")
     args = parser.parse_args()
 
     # Echo the resolved config so the first run's log makes it obvious which
@@ -123,6 +144,12 @@ def main() -> None:
             obs_horizon=16,
             max_steps=args.rollout_max_steps,
             use_history=False,
+            subgoal_type=args.subgoal_type,
+            decision_warm_cap=args.decision_warm_cap,
+            n_key_frames=args.n_key_frames,
+            n_recent_frames=args.n_recent_frames,
+            reveal_window=args.reveal_window,
+            n_candidate_frames=args.n_candidate_frames,
         )
 
     dataset = StateDataset.from_task_list(
@@ -145,8 +172,12 @@ def main() -> None:
         seed_match_group=args.seed_match_group,
         rollout_max_steps=args.rollout_max_steps,
         subgoal_type=args.subgoal_type,
+        joint_selection=args.joint_selection,
+        n_candidate_frames=args.n_candidate_frames,
+        max_keyframes=args.max_keyframes,
         output_dir=args.output_dir,
         seed=args.seed,
+        debug_subgoals=args.debug_subgoals,
     )
 
     trainer = GRPOTrainer(

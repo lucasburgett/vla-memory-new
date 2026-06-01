@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .prompts import build_messages
+from .prompts import build_messages, parse_subgoal_output
 
 
 # Inference / sampling guards: keep image and video token budgets identical to
@@ -42,13 +42,52 @@ _MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 class SampleResult:
     """One sampled subgoal candidate plus the bookkeeping GRPO needs."""
 
-    text: str
+    text: str                    # raw decoded JSON response from the VLM
+    subtask: str                 # parsed current_subtask — the grounded subgoal sent to π0.5
+    keyframe_positions: List[int]  # parsed 1-indexed keyframe nominations (learned-selection path)
     token_ids: torch.Tensor      # (T,) int64 — generated tokens only
     logprobs: torch.Tensor       # unused placeholder; GRPO loss recomputes logp with grad
     prompt_input_ids: torch.Tensor      # (P,) int64 — to recompute logp later
     prompt_attention_mask: torch.Tensor  # (P,) int64
     pixel_values: Optional[torch.Tensor] # vision tower input (image grid)
     image_grid_thw: Optional[torch.Tensor]
+
+
+def _first_stop_index(ids: torch.Tensor, stop_ids: Sequence[int]) -> int:
+    """Index of the first token in ``ids`` matching any id in ``stop_ids``.
+
+    Returns ``len(ids)`` if none match. The SFT'd Qwen3-VL terminates its turn
+    with ``<|im_end|>``, which is NOT always the tokenizer's nominal
+    ``eos_token_id`` (that can be ``<|endoftext|>``). Trimming on a single id
+    therefore missed the real stop and let the decoded subgoal keep ``<|im_end|>``
+    plus whatever the model rambled afterward — the v1 "generations never
+    terminate" bug. Trim on the full stop set instead.
+    """
+    if not stop_ids:
+        return int(ids.numel())
+    stop = torch.as_tensor(list(stop_ids), device=ids.device, dtype=ids.dtype)
+    hits = torch.isin(ids, stop).nonzero(as_tuple=False)
+    return int(hits[0].item()) if hits.numel() > 0 else int(ids.numel())
+
+
+def _looks_degenerate(token_ids: torch.Tensor, max_new_tokens: int) -> bool:
+    """Heuristic: did greedy decoding collapse (the v4 SFT failure mode)?
+
+    A healthy subgoal is short and terminates. Collapse looks like (a) running the
+    whole ``max_new_tokens`` budget without emitting EOS, or (b) one token
+    dominating the output (e.g. 'Waitwaitwait...'). Either flags a degenerate
+    adapter. See ``project_sft_v4_adapter_degenerate``.
+    """
+    n = int(token_ids.numel())
+    if n == 0:
+        return True
+    if n >= max_new_tokens:          # ran the whole budget → never stopped
+        return True
+    if n >= 4:
+        _, counts = token_ids.unique(return_counts=True)
+        if int(counts.max()) / n > 0.5:   # a single token is >half the output
+            return True
+    return False
 
 
 class QwenSubgoalPolicy:
@@ -116,7 +155,33 @@ class QwenSubgoalPolicy:
             self.has_reference = False
 
         self.model.set_adapter("policy")
-        self._eos_token_id = self.processor.tokenizer.eos_token_id
+
+        # Build the explicit stop-token set. The SFT model ends its turn with
+        # <|im_end|>; the tokenizer's nominal eos_token_id may be <|endoftext|>.
+        # We must (a) pass these to generate() — relying on
+        # generation_config.eos_token_id silently failed when the PEFT load left
+        # it unset, so generations ran to max_new_tokens forever (v1 no-EOS bug),
+        # and (b) trim on the same set in sample_subgoals.
+        tok = self.processor.tokenizer
+        stop_ids: List[int] = []
+        if tok.eos_token_id is not None:
+            stop_ids.append(int(tok.eos_token_id))
+        im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
+        if (
+            isinstance(im_end_id, int)
+            and im_end_id >= 0
+            and im_end_id != getattr(tok, "unk_token_id", None)
+            and im_end_id not in stop_ids
+        ):
+            stop_ids.append(im_end_id)
+        if not stop_ids:
+            raise ValueError(
+                "No stop token resolved for generation: tokenizer has no "
+                "eos_token_id and '<|im_end|>' is not in the vocab. Subgoals "
+                "would never terminate."
+            )
+        self._eos_token_id = stop_ids[0]   # pad_token_id / back-compat
+        self._stop_token_ids = stop_ids    # full set for generate() + trim
 
     # ------------------------------------------------------------------
     # Input prep
@@ -124,35 +189,52 @@ class QwenSubgoalPolicy:
 
     def _prepare_inputs(
         self,
-        image: np.ndarray,
+        key_frames: Sequence[np.ndarray],
+        recent_frames: Sequence[np.ndarray],
         task_goal: str,
-        history_subgoals: List[str],
-        subgoal_type: str,
         has_video_demo: bool,
+        history_subgoals: Optional[List[str]] = None,
+        debug: bool = False,
     ) -> dict:
+        """Build a multi-image MemER prompt.
+
+        ``key_frames`` (the remembered past) are placed first, then
+        ``recent_frames`` (current execution context) — the same order the
+        prompt's ``<image>`` placeholders appear, which the Qwen processor pairs
+        positionally with the ``images`` list. At least one frame is required.
+        ``history_subgoals`` carries the completed-subtask timing signal.
+        """
+        frames = list(key_frames) + list(recent_frames)
+        if not frames:
+            raise ValueError(
+                "MemER prompt needs at least one frame, but key_frames and "
+                "recent_frames are both empty."
+            )
         messages = build_messages(
             task_goal=task_goal,
+            n_key_frames=len(key_frames),
+            n_recent_frames=len(recent_frames),
             history_subgoals=history_subgoals,
-            subgoal_type=subgoal_type,
             has_video_demo=has_video_demo,
         )
 
-        # Convert numpy HxWx3 uint8 to PIL for the processor.
-        pil_image = Image.fromarray(np.ascontiguousarray(image))
+        # Convert each numpy HxWx3 uint8 frame to PIL, preserving key→recent order.
+        pil_images = [Image.fromarray(np.ascontiguousarray(f)) for f in frames]
 
         chat_text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
-        # The SFT dataset builder (`build_vlm_subgoal_dataset_qwenvl.py`) emits
+        # The SFT dataset builder (`build_vlm_subgoal_dataset_memer.py`) emits
         # the literal strings ``<image>`` / ``<video>``. ms-swift expands those
         # to the Qwen3-VL vision-token sequence before tokenizing during SFT.
         # We replicate that substitution here so the HF processor sees the
         # tokens it actually recognizes (``<|vision_start|><|image_pad|>
-        # <|vision_end|>``); without it, ``image_grid_thw`` carries 1 image's
-        # worth of patches but ``input_ids`` has no vision-start, and
-        # generate's ``_expand_inputs_for_generation`` crashes with
-        # ``split_with_sizes ... split_sizes=[0]``.
+        # <|vision_end|>``); without it, ``image_grid_thw`` carries the images'
+        # patches but ``input_ids`` has no vision-start, and generate's
+        # ``_expand_inputs_for_generation`` crashes with
+        # ``split_with_sizes ... split_sizes=[0]``. ``replace`` hits every
+        # ``<image>`` (one per frame), so the count stays in sync with ``images``.
         chat_text = chat_text.replace(
             "<image>", "<|vision_start|><|image_pad|><|vision_end|>"
         ).replace(
@@ -161,10 +243,25 @@ class QwenSubgoalPolicy:
 
         inputs = self.processor(
             text=[chat_text],
-            images=[pil_image],
+            images=pil_images,
             return_tensors="pt",
             padding=True,
         )
+        if debug:
+            iid = inputs["input_ids"][0]
+            pad_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            n_img = int((iid == pad_id).sum()) if isinstance(pad_id, int) and pad_id >= 0 else -1
+            pv = inputs.get("pixel_values")
+            thw = inputs.get("image_grid_thw")
+            shapes = [getattr(f, "shape", None) for f in frames]
+            print(
+                f"[qwen][debug] n_frames={len(frames)} "
+                f"(key={len(key_frames)} recent={len(recent_frames)}) shapes={shapes} | "
+                f"n_image_pad_tokens={n_img} prompt_len={int(iid.numel())} "
+                f"pixel_values={tuple(pv.shape) if pv is not None else None} "
+                f"grid_thw={thw.tolist() if thw is not None else None}",
+                flush=True,
+            )
         return {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
 
     # ------------------------------------------------------------------
@@ -174,26 +271,36 @@ class QwenSubgoalPolicy:
     @torch.no_grad()
     def sample_subgoals(
         self,
-        image: np.ndarray,
+        key_frames: Sequence[np.ndarray],
+        recent_frames: Sequence[np.ndarray],
         task_goal: str,
-        history_subgoals: List[str],
+        history_subgoals: Optional[List[str]] = None,
         k: int = 4,
-        max_new_tokens: int = 64,
+        max_new_tokens: int = 128,
         temperature: float = 0.9,
         top_p: float = 0.95,
-        subgoal_type: str = "simple_subgoal",
         has_video_demo: bool = False,
+        debug: bool = False,
     ) -> List[SampleResult]:
-        """Draw ``k`` subgoal candidates for one state. Used for GRPO rollouts."""
+        """Draw ``k`` subgoal candidates for one memory state. Used for GRPO rollouts.
+
+        Conditions on ``key_frames`` (the remembered past) + ``recent_frames``
+        (current execution context) + ``history_subgoals`` (completed-subtask
+        timing). Each candidate's raw JSON response is parsed into ``subtask`` (the
+        grounded subgoal handed to π0.5) and ``keyframe_positions``.
+        ``max_new_tokens`` defaults to 128 because the MemER target is a JSON
+        object, not a bare phrase.
+        """
         self.model.set_adapter("policy")
         self.model.eval()
 
         inputs = self._prepare_inputs(
-            image=image,
+            key_frames=key_frames,
+            recent_frames=recent_frames,
             task_goal=task_goal,
-            history_subgoals=history_subgoals,
-            subgoal_type=subgoal_type,
             has_video_demo=has_video_demo,
+            history_subgoals=history_subgoals,
+            debug=debug,
         )
 
         prompt_len = inputs["input_ids"].shape[1]
@@ -208,7 +315,39 @@ class QwenSubgoalPolicy:
             num_return_sequences=k,
             return_dict_in_generate=True,
             pad_token_id=self._eos_token_id,
+            # Pass the stop set explicitly — do NOT rely on
+            # generation_config.eos_token_id (unset after the PEFT load → the
+            # model never stopped: the v1 64-token-ramble bug).
+            eos_token_id=self._stop_token_ids,
         )
+
+        if debug:
+            # Adapter-on-vs-off probe: greedy-decode the BASE model (adapter
+            # disabled) on the SAME input. If BASE is coherent but the adapter
+            # output is "Wait..." garbage → the SFT adapter is the problem; if
+            # BASE is ALSO garbage → the base load / forward path is. Splits the two.
+            try:
+                with self.model.disable_adapter():
+                    base_full = self.model.generate(
+                        **inputs,
+                        do_sample=False,
+                        max_new_tokens=max_new_tokens,
+                        num_return_sequences=1,
+                        pad_token_id=self._eos_token_id,
+                        eos_token_id=self._stop_token_ids,
+                    )
+                base_ids = base_full[0][prompt_len:]
+                base_cut = _first_stop_index(base_ids, self._stop_token_ids)
+                base_txt = self.processor.tokenizer.decode(
+                    base_ids[:base_cut], skip_special_tokens=False
+                ).strip()
+                print(
+                    f"[qwen][debug] BASE(no-adapter) greedy ntok={int(base_cut)} "
+                    f"subgoal={base_txt!r}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[qwen][debug] base-adapter probe failed: {exc!r}", flush=True)
 
         sequences = gen_out.sequences  # (k, prompt_len + new_len)
         gen_ids = sequences[:, prompt_len:]
@@ -219,20 +358,24 @@ class QwenSubgoalPolicy:
 
         results: List[SampleResult] = []
         for i in range(k):
-            # Stop at first EOS to avoid scoring pad tokens.
+            # Trim at the first stop token (any id in the stop set) to avoid
+            # scoring pad / post-turn tokens. Searching the full set — not just
+            # self._eos_token_id — is what catches <|im_end|>.
             ids_i = gen_ids[i]
-            eos_pos = (ids_i == self._eos_token_id).nonzero(as_tuple=False)
-            cut = eos_pos[0].item() if eos_pos.numel() > 0 else ids_i.numel()
+            cut = _first_stop_index(ids_i, self._stop_token_ids)
             # ``skip_special_tokens=False`` keeps Qwen3-VL's ``<|box_start|>`` /
             # ``<|box_end|>`` markers in the decoded string — grounded_subgoal
             # mode needs them. We trim the trailing EOS ourselves via ``cut``.
             text = self.processor.tokenizer.decode(
                 ids_i[:cut], skip_special_tokens=False
             ).strip()
+            subtask, keyframe_positions = parse_subgoal_output(text)
 
             results.append(
                 SampleResult(
                     text=text,
+                    subtask=subtask,
+                    keyframe_positions=keyframe_positions,
                     token_ids=ids_i[:cut].detach().cpu(),
                     logprobs=torch.empty(0),  # unused; loss recomputes logp with grad
                     prompt_input_ids=inputs["input_ids"][0].detach().cpu(),
@@ -242,6 +385,52 @@ class QwenSubgoalPolicy:
                 )
             )
         return results
+
+    # ------------------------------------------------------------------
+    # Greedy decode (eval / validation / probe set)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def greedy_subgoal(
+        self,
+        key_frames: Sequence[np.ndarray],
+        recent_frames: Sequence[np.ndarray],
+        task_goal: str,
+        history_subgoals: Optional[List[str]] = None,
+        has_video_demo: bool = False,
+        max_new_tokens: int = 128,
+    ) -> Tuple[str, torch.Tensor]:
+        """Deterministically greedy-decode ONE response. For eval / probe / validation.
+
+        Unlike ``sample_subgoals`` (which samples K candidates for RL exploration),
+        this is argmax decoding — the cleanest signal for "did the adapter collapse"
+        and the right decode for a held-out probe metric. Returns the RAW decoded
+        text (parse with ``parse_subgoal_output``) and ``gen_token_ids`` (pass to
+        ``_looks_degenerate``).
+        """
+        self.model.set_adapter("policy")
+        self.model.eval()
+        inputs = self._prepare_inputs(
+            key_frames=key_frames,
+            recent_frames=recent_frames,
+            task_goal=task_goal,
+            has_video_demo=has_video_demo,
+            history_subgoals=history_subgoals,
+        )
+        prompt_len = inputs["input_ids"].shape[1]
+        out = self.model.generate(
+            **inputs,
+            do_sample=False,
+            max_new_tokens=max_new_tokens,
+            num_return_sequences=1,
+            pad_token_id=self._eos_token_id,
+            eos_token_id=self._stop_token_ids,
+        )
+        ids = out[0][prompt_len:]
+        cut = _first_stop_index(ids, self._stop_token_ids)
+        gen_ids = ids[:cut].detach().cpu()
+        text = self.processor.tokenizer.decode(gen_ids, skip_special_tokens=False).strip()
+        return text, gen_ids
 
     # ------------------------------------------------------------------
     # Log-prob recomputation (gradient step)

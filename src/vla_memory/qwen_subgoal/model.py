@@ -195,6 +195,7 @@ class QwenSubgoalPolicy:
         has_video_demo: bool,
         history_subgoals: Optional[List[str]] = None,
         debug: bool = False,
+        mode: str = "use",
     ) -> dict:
         """Build a multi-image MemER prompt.
 
@@ -216,6 +217,7 @@ class QwenSubgoalPolicy:
             n_recent_frames=len(recent_frames),
             history_subgoals=history_subgoals,
             has_video_demo=has_video_demo,
+            mode=mode,
         )
 
         # Convert each numpy HxWx3 uint8 frame to PIL, preserving key→recent order.
@@ -281,6 +283,7 @@ class QwenSubgoalPolicy:
         top_p: float = 0.95,
         has_video_demo: bool = False,
         debug: bool = False,
+        mode: str = "use",
     ) -> List[SampleResult]:
         """Draw ``k`` subgoal candidates for one memory state. Used for GRPO rollouts.
 
@@ -301,6 +304,7 @@ class QwenSubgoalPolicy:
             has_video_demo=has_video_demo,
             history_subgoals=history_subgoals,
             debug=debug,
+            mode=mode,
         )
 
         prompt_len = inputs["input_ids"].shape[1]
@@ -399,6 +403,7 @@ class QwenSubgoalPolicy:
         history_subgoals: Optional[List[str]] = None,
         has_video_demo: bool = False,
         max_new_tokens: int = 128,
+        mode: str = "use",
     ) -> Tuple[str, torch.Tensor]:
         """Deterministically greedy-decode ONE response. For eval / probe / validation.
 
@@ -416,6 +421,7 @@ class QwenSubgoalPolicy:
             task_goal=task_goal,
             has_video_demo=has_video_demo,
             history_subgoals=history_subgoals,
+            mode=mode,
         )
         prompt_len = inputs["input_ids"].shape[1]
         out = self.model.generate(

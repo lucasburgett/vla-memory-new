@@ -34,12 +34,25 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shutil
 from typing import List, Optional, Tuple
 
 import numpy as np
 
-from vla_memory.qwen_subgoal.prompts import SUBGOAL_SYSTEM_PROMPT, build_user_prompt
+# Strips the copyable "that hides the {colour} cube" suffix off the grounded pick
+# subgoal so the COORDINATE is the only variable token span in the SFT target.
+_HIDES_SUFFIX = re.compile(r"\s+that hides the .*$", re.IGNORECASE)
+
+# Pixel <y,x> 0–256 → Qwen-native <x,y> 0–1000. The pair (with from_qwen_xy, used
+# at inference in rollout) lives in qwen_subgoal.coords so the build-time target
+# and the inference round-trip share one source of truth.
+from vla_memory.qwen_subgoal.coords import to_qwen_xy as _to_qwen_xy
+from vla_memory.qwen_subgoal.prompts import (
+    SELECT_SYSTEM_PROMPT,
+    SUBGOAL_SYSTEM_PROMPT,
+    build_user_prompt,
+)
 
 
 class MemorySFTBuilder:
@@ -144,16 +157,31 @@ class MemorySFTBuilder:
         if len(captured) < 2:
             return 0
 
-        # Decision point: first frame where the online subgoal leaves the initial
-        # (press) phase — the post-occlusion memory choice. Mirrors rollout._warmup.
-        phase0 = simple_online(captured[0])
-        decision_ts = None
-        for ts in captured:
-            if simple_online(ts) != phase0:
-                decision_ts = ts
-                break
+        # Decision point = the first PICK frame (the post-occlusion memory choice).
+        # Detect the pick subgoal DIRECTLY rather than "first subgoal change": a
+        # multi-phase task like ButtonUnmaskSwap presses TWO buttons, so the first
+        # change is press1→press2 (~step 64) — before the containers finish swapping
+        # and long before the pick. The pick subgoal carries the remembered-container
+        # grounding we train on. For single-button ButtonUnmask this resolves to the
+        # SAME frame as before (press→pick is the only transition), so non-Swap
+        # behavior + prompt parity are unchanged.
+        decision_ts = next(
+            (ts for ts in captured if "pick up the container" in simple_online(ts)), None
+        )
         if decision_ts is None:
             return 0
+
+        # Completed subtasks before the pick (the timing signal): distinct non-pick
+        # simple subgoals seen so far, in order. ButtonUnmask → ["press the button"];
+        # ButtonUnmaskSwap → ["press the first button", "press the second button"].
+        # MUST match rollout._warmup's history for prompt parity.
+        history: List[str] = []
+        for ts in captured:
+            if ts >= decision_ts:
+                break
+            sg = simple_online(ts)
+            if sg and "pick up the container" not in sg and sg not in history:
+                history.append(sg)
 
         grounded = (
             episode_data[f"timestep_{decision_ts}"]["info"]["grounded_subgoal_online"][()]
@@ -162,6 +190,14 @@ class MemorySFTBuilder:
         )
         if not grounded:
             return 0
+        # Coordinate-focused target: drop "that hides the {colour} cube" so the
+        # coordinate (the memory output) is the dominant, only-variable span. The
+        # model can't earn token_acc by copying the colour phrase from the task
+        # goal — it MUST produce the coordinate; token_acc now reflects coordinate
+        # accuracy. Colour stays in the PROMPT (task spec: which cube). GroundSG is
+        # coordinate-driven (probe: colour-insensitive), so the shorter subgoal is fine.
+        grounded = _HIDES_SUFFIX.sub("", grounded).strip()
+        grounded = _to_qwen_xy(grounded)   # <y,x> 0–255 px → Qwen-native <x,y> 0–1000
 
         window = [ts for ts in captured if ts <= decision_ts]
         n = len(window)
@@ -180,54 +216,85 @@ class MemorySFTBuilder:
 
         recent_paths = [save(ts) for ts in recent_ts]
 
+        # Memer-style "important" timesteps over the pre-pick window (computed once
+        # per episode): subgoal transitions + action-velocity minima. The SELECT label
+        # points the kept keyframes at the candidates nearest these. RoboMME's own
+        # keyframe definition; on Swap the transitions align with the container swaps,
+        # so the kept frames span reveal→swaps (what the USE call needs to deduce the
+        # post-swap container position) — the reveal-window heuristic missed them.
+        important_ts = self._memer_important(episode_data, window, simple_online)
+
         n_written = 0
         for a in range(self.augment_factor):
-            key_pos = self._key_positions(reveal_end, a)
-            key_ts = [window[p] for p in key_pos]
-            key_paths = [save(ts) for ts in key_ts]
+            if self.also_select:
+                # JOINT: the USE call must train on the SAME frames a correct SELECT
+                # keeps — at GRPO the USE call receives apply_selection's output, NOT a
+                # reveal-window slice. So build the candidate window + memer SELECT label
+                # first, then point the USE keyframes at the selected candidates. This
+                # keeps SFT-USE ≡ GRPO-USE (the kept frames) and, on Swap, trains the
+                # USE head on the swap-tracking frames it will actually receive.
+                cand_pos = self._candidate_window(n, a)
+                cand_ts = [window[p] for p in cand_pos]
+                cand_paths = [save(ts) for ts in cand_ts]
+                sel_label = self._memer_label(cand_ts, important_ts)
+                key_paths = [cand_paths[p - 1] for p in sel_label]
+            else:
+                # ONE-SHOT: reveal-window even-spacing — matches rollout._select_memory_frames
+                # and preserves the validated coordinate checkpoint's prompt (parity).
+                key_pos = self._key_positions(reveal_end, a)
+                key_paths = [save(window[p]) for p in key_pos]
 
             user = build_user_prompt(
                 task_goal=task_goal,
                 n_key_frames=len(key_paths),
                 n_recent_frames=len(recent_paths),
-                # The completed-subtask timing signal: phase0 is the pre-transition
-                # simple subgoal ("press the button"). Without it the model can't
-                # tell the press is done and collapses to a constant "press the
-                # button" output (the keyframes-only prompt's failure mode).
-                history_subgoals=[phase0],
+                # The completed-subtask timing signal (e.g. ["press the button"], or
+                # both presses on ButtonUnmaskSwap). Without it the model can't tell
+                # the press phase is done and collapses to a constant "press the
+                # button" output (the keyframes-only prompt's failure mode). Matches
+                # rollout.peek_at_decision_point's history (prompt parity).
+                history_subgoals=history,
                 has_video_demo=False,
             )
             assistant = json.dumps({"current_subtask": grounded, "keyframe_positions": []})
             self._write_row(user, assistant, key_paths + recent_paths)
             n_written += 1
 
-            # SELECT row (joint pipeline): given the broad candidate window, KEEP
-            # the reveal (cube-visible) frames. history=[] (the SELECT call is
-            # "observe & select"); current_subtask = the action shown (phase0).
-            # Parity with rollout._joint_group / _select_candidate_frames.
+            # SELECT row (joint pipeline): from the broad candidate window, KEEP the
+            # memer-important frames (transitions + action-velocity minima → spans
+            # reveal and, on Swap, the container swaps). DISTINCT schema from the USE
+            # row — SELECT_SYSTEM_PROMPT + mode="select" prompt + a target carrying
+            # ONLY keyframe_positions (no current_subtask). The two calls share near-
+            # identical images, so without distinct prompts the model collapsed
+            # keyframe_positions to the USE majority `[]` and the SELECT head learned
+            # nothing (project_sft_plan_adjustments). history=[] (observe & select);
+            # parity with trainer._joint_group's SELECT call (mode="select").
             if self.also_select:
-                cand_pos = self._candidate_window(n, a)
-                cand_ts = [window[p] for p in cand_pos]
-                cand_paths = [save(ts) for ts in cand_ts]
-                reveal_label = self._reveal_label(cand_ts, exec_start)
                 sel_user = build_user_prompt(
                     task_goal=task_goal,
                     n_key_frames=0,
                     n_recent_frames=len(cand_paths),
                     history_subgoals=[],
                     has_video_demo=False,
+                    mode="select",
                 )
-                sel_assistant = json.dumps(
-                    {"current_subtask": phase0, "keyframe_positions": reveal_label}
+                sel_assistant = json.dumps({"keyframe_positions": sel_label})
+                self._write_row(
+                    sel_user, sel_assistant, cand_paths, system=SELECT_SYSTEM_PROMPT
                 )
-                self._write_row(sel_user, sel_assistant, cand_paths)
                 n_written += 1
         return n_written
 
-    def _write_row(self, user: str, assistant: str, image_paths: List[str]) -> None:
+    def _write_row(
+        self,
+        user: str,
+        assistant: str,
+        image_paths: List[str],
+        system: str = SUBGOAL_SYSTEM_PROMPT,
+    ) -> None:
         row = {
             "messages": [
-                {"role": "system", "content": SUBGOAL_SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
                 {"role": "assistant", "content": assistant},
             ],
@@ -254,14 +321,51 @@ class MemorySFTBuilder:
                 out.append(int(p))
         return out
 
-    def _reveal_label(self, cand_ts: List[int], exec_start: int) -> List[int]:
-        """1-indexed candidate positions whose timestep is in the reveal window
-        (cube-visible) — the SELECT target — capped at ``max_keyframes``."""
-        reveal = [j + 1 for j, ts in enumerate(cand_ts) if (ts - exec_start) < self.reveal_window]
-        if len(reveal) > self.max_keyframes:
-            idx = np.linspace(0, len(reveal) - 1, num=self.max_keyframes, dtype=int)
-            reveal = [reveal[i] for i in idx]
-        return reveal
+    def _memer_important(self, episode_data, window: List[int], simple_online) -> List[int]:
+        """Memer-style 'important' timesteps over the pre-pick ``window``: subgoal
+        transitions + action-velocity minima (reuses the submodule's
+        ``find_local_minima``). RoboMME's own keyframe definition — task-agnostic, so
+        it generalizes from ButtonUnmask to Swap (the transitions line up with the
+        container swaps). Returns absolute timesteps; the start frame (reveal) is
+        always included."""
+        if not window:
+            return []
+        from mme_vla_suite.dataset_builder.build_vlm_subgoal_dataset_memer import (  # type: ignore
+            find_local_minima,
+        )
+
+        trans, prev = [], None
+        for ts in window:
+            s = simple_online(ts)
+            if prev is not None and s != prev:
+                trans.append(ts)
+            prev = s
+        try:
+            minima_pos = find_local_minima(episode_data, window)
+        except Exception as exc:  # missing joint_state/action keys, etc. — degrade gracefully
+            print(f"[memory-sft] find_local_minima failed ({exc!r}); transitions only", flush=True)
+            minima_pos = []
+        minima_ts = [window[i] for i in minima_pos if 0 <= i < len(window)]
+        return sorted(set([window[0]] + trans + minima_ts))
+
+    def _memer_label(self, cand_ts: List[int], important_ts: List[int]) -> List[int]:
+        """1-indexed candidate positions NEAREST the memer important timesteps — the
+        SELECT target, capped at ``max_keyframes``. Falls back to even spacing if no
+        important frames were found, so the SELECT head still gets a non-empty signal."""
+        if not cand_ts:
+            return []
+        if not important_ts:
+            k = min(self.max_keyframes, len(cand_ts))
+            return sorted({int(p) + 1 for p in np.linspace(0, len(cand_ts) - 1, num=k, dtype=int)})
+        labels = set()
+        for imp in important_ts:
+            j = min(range(len(cand_ts)), key=lambda k: abs(cand_ts[k] - imp))
+            labels.add(j + 1)
+        out = sorted(labels)
+        if len(out) > self.max_keyframes:
+            idx = np.linspace(0, len(out) - 1, num=self.max_keyframes, dtype=int)
+            out = [out[i] for i in idx]
+        return out
 
     # ------------------------------------------------------------------
     # Memory-frame selection

@@ -35,6 +35,8 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from vla_memory.qwen_subgoal.coords import from_qwen_xy
+
 
 @dataclasses.dataclass
 class RolloutResult:
@@ -201,7 +203,17 @@ class RolloutWorker:
 
         img, wrist, robot_state = image_buf[-1], wrist_buf[-1], state_buf[-1]
         captured: List[np.ndarray] = [img]
-        phase0 = self._simple_phase(self.env_runner)
+        # Track COMPLETED subtasks (distinct non-pick simple phases) up to the pick —
+        # the timing signal carried in the prompt. MUST match the builder's history
+        # (prompt parity). ButtonUnmask → ["press the button"]; ButtonUnmaskSwap →
+        # ["press the first button", "press the second button"].
+        history: List[str] = []
+
+        def _record(phase: str) -> None:
+            if phase and "pick up the container" not in phase and phase not in history:
+                history.append(phase)
+
+        _record(self._simple_phase(self.env_runner))
 
         n_steps = 0
         success_flag = "unknown"
@@ -219,7 +231,7 @@ class RolloutWorker:
                 if img is None:
                     return captured, task_goal, n_steps, True, "error", (
                         None, None, None, image_buf, wrist_buf, state_buf, exec_start_idx
-                    ), phase0
+                    ), history
                 image_buf.append(img)
                 wrist_buf.append(wrist)
                 state_buf.append(robot_state)
@@ -228,19 +240,24 @@ class RolloutWorker:
                 if stop:
                     terminated = True
                     break
-                # Decision point: the oracle has moved on from the warm-up phase
-                # (e.g. "press the button" → "pick the container …"). Stop the
-                # instant the new phase appears so the VLM owns that decision.
-                if self._simple_phase(self.env_runner) != phase0:
+                # Decision point = the PICK subgoal (not the first phase change): a
+                # multi-phase task (ButtonUnmaskSwap presses TWO buttons) changes phase
+                # at press1→press2, BEFORE the swaps finish. Record each completed
+                # non-pick phase as we pass it; stop at the pick so the VLM owns it.
+                # Single-button ButtonUnmask resolves to the SAME frame/history as
+                # before (parity preserved).
+                phase = self._simple_phase(self.env_runner)
+                if "pick up the container" in phase:
                     reached_transition = True
                     break
+                _record(phase)
                 if n_steps >= self.decision_warm_cap:
                     break
             if terminated or reached_transition or n_steps >= self.decision_warm_cap:
                 break
 
         carry = (img, wrist, robot_state, image_buf, wrist_buf, state_buf, exec_start_idx)
-        return captured, task_goal, n_steps, terminated, success_flag, carry, phase0
+        return captured, task_goal, n_steps, terminated, success_flag, carry, history
 
     def _select_memory_frames(
         self, captured: Sequence[np.ndarray], warm_steps: int
@@ -300,7 +317,7 @@ class RolloutWorker:
         rebuilds the env from the seed (so the cube→container layout matches what
         the VLM saw here) and warms up afresh to the decision point.
         """
-        captured, task_goal, warm_steps, terminated, success_flag, _, phase0 = self._warmup(
+        captured, task_goal, warm_steps, terminated, success_flag, _, history = self._warmup(
             episode_id, seed
         )
         key_frames, recent_frames = self._select_memory_frames(captured, warm_steps)
@@ -309,9 +326,10 @@ class RolloutWorker:
             key_frames=key_frames,
             recent_frames=recent_frames,
             task_goal=task_goal,
-            # The completed-subtask timing signal (e.g. "press the button"); the
-            # SFT prompt carries the same line so train/inference agree.
-            history_subgoals=[phase0] if phase0 else [],
+            # The completed-subtask timing signal (e.g. ["press the button"], or both
+            # presses on ButtonUnmaskSwap); the SFT prompt carries the same line so
+            # train/inference agree (prompt parity).
+            history_subgoals=history,
             candidate_frames=candidate_frames,
             current_frame=captured[-1] if captured else None,
             warm_steps=warm_steps,
@@ -331,7 +349,14 @@ class RolloutWorker:
     ) -> RolloutResult:
         """Warm up to the decision point (oracle-driven), then execute
         ``sampled_subgoal`` to the episode end and score the outcome."""
-        captured, task_goal, n_steps, terminated, success_flag, carry, _phase0 = self._warmup(
+        # ``sampled_subgoal`` is the VLM's prediction in Qwen-native <x,y> 0–1000
+        # (the SFT target space). GroundSG was trained on the oracle's <y,x> 0–256
+        # PIXEL format, so convert here — the SINGLE point where VLM output reaches
+        # the executor (the oracle warm-up below and rollout_oracle use native
+        # coords and must NOT be converted). Skipping this feeds GroundSG a wrong
+        # coordinate → silently wrong reward → fake flatline. See coords.from_qwen_xy.
+        sampled_subgoal = from_qwen_xy(sampled_subgoal)
+        captured, task_goal, n_steps, terminated, success_flag, carry, _history = self._warmup(
             episode_id, seed
         )
         img, wrist, robot_state, image_buf, wrist_buf, state_buf, exec_start_idx = carry

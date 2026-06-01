@@ -446,11 +446,24 @@ def build_dataset(
 def build_memory_dataset(
     raw_data_path: str = f"{MOUNT}/data/robomme_data_h5",
     out_dir: str = f"{MOUNT}/data/preprocessed",
-    only_tasks: str = "ButtonUnmask",
+    # Multi-task Permanence (NON-Swap) warm-up. Single-task narrow data forced
+    # lr≤4e-6 (collapse above ~8e-6) which UNDERFITS the coordinate
+    # (project_qwen_coordinate_space RESULT: constant ~<315,305>). Adding VideoUnmask
+    # lifts the collapse threshold so the SFT can run a higher lr and actually fit
+    # the grounding. VideoUnmask is builder-compatible: phase0 is "static" (vs
+    # "press the button") but the decision-point + "pick up the container at <> that
+    # hides the {color} cube" target + reveal_window=64 are identical. Swap variants
+    # are EXCLUDED — the cube moves mid-episode, so reveal-window keyframes go stale
+    # (those belong to the later keyframe-selection work; see JOINT_MEMORY_DESIGN).
+    only_tasks: str = "ButtonUnmask,VideoUnmask",
     n_key_frames: int = 4,
     n_recent_frames: int = 2,
     reveal_window: int = 64,
-    augment_factor: int = 5,   # rows/episode via varied reveal keyframe subsets
+    # 5→2: augment_factor emits N rows/episode with the SAME target but different
+    # reveal keyframes. =5 over-teaches keyframe-INVARIANCE ("frames don't matter")
+    # which feeds input-blindness; 2 keeps a little subset-robustness. Multi-task
+    # already 2×'s the distinct-episode count, so volume isn't the concern.
+    augment_factor: int = 2,   # rows/episode via varied reveal keyframe subsets
     n_candidate_frames: int = 12,
     max_keyframes: int = 4,
     joint: bool = True,        # also emit SELECT rows (candidate window → keyframe labels)
@@ -485,6 +498,93 @@ def build_memory_dataset(
 
 
 # ---------------------------------------------------------------------------
+# Stage A.1b — Swap-demo inspection (probe before building the Swap SFT data)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    cpu=4.0,
+    memory=16 * 1024,
+    timeout=1800,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def inspect_swap_demos(
+    raw_data_path: str = f"{MOUNT}/data/robomme_data_h5",
+    only_task: str = "ButtonUnmaskSwap",
+    n_episodes: int = 3,
+    every: int = 8,
+) -> dict:
+    """Dump the per-timestep online subgoal structure for a few Swap demo episodes.
+
+    The Swap builder changes (decision point, SELECT labels, history) depend on facts
+    we can only see in the demo data: where the PICK subgoal starts (vs the two button
+    presses), whether ``grounded_subgoal_online`` at the pick gives the POST-swap final
+    container position, and how the press/pick phases line up with the swap windows
+    (``ButtonUnmaskSwap`` swaps at steps 64/114/164 per ``swap_times``). This probe
+    prints the subgoal sequence + transitions + grounded targets so we design the
+    swap-aware label against REAL structure instead of guessing. Read-only; no GPU.
+    """
+    import os as _os
+
+    import h5py
+
+    from mme_vla_suite.dataset_builder.robomme_h5_utils import (  # type: ignore
+        first_execution_step,
+        get_env_id_from_filename,
+        get_episode_indices,
+        get_task_goal,
+        get_timestep_indices,
+    )
+
+    files = sorted(f for f in _os.listdir(raw_data_path) if f.endswith(".h5"))
+    matched = [f for f in files if get_env_id_from_filename(f) == only_task]
+    if not matched:
+        raise RuntimeError(
+            f"No H5 for task {only_task!r} under {raw_data_path}. Available env_ids: "
+            f"{sorted({get_env_id_from_filename(f) for f in files})}"
+        )
+
+    out: list = []
+    for file in matched:
+        with h5py.File(_os.path.join(raw_data_path, file), "r") as data:
+            for ep in list(get_episode_indices(data, n_episodes)):
+                ed = data[f"episode_{ep}"]
+                goal = get_task_goal(ed, lower=True)
+                exec_start = int(first_execution_step(ed))
+                tsx = [ts for ts in get_timestep_indices(ed) if ts >= exec_start]
+                print(
+                    f"\n=== {only_task} ep{ep} | goal={goal!r} | exec_start={exec_start} "
+                    f"| n_exec_ts={len(tsx)} ===",
+                    flush=True,
+                )
+                prev = None
+                transitions: list = []
+                for ts in tsx:
+                    info = ed[f"timestep_{ts}"]["info"]
+                    s = info["simple_subgoal_online"][()].decode().strip()
+                    g = info["grounded_subgoal_online"][()].decode().strip()
+                    rel = ts - exec_start
+                    changed = s != prev
+                    if changed:
+                        transitions.append((rel, s, g))
+                        print(f"  t={ts:>4} (rel {rel:>4}) <-- CHANGE simple={s!r}", flush=True)
+                        print(f"             grounded={g!r}", flush=True)
+                    elif rel % every == 0:
+                        print(f"  t={ts:>4} (rel {rel:>4})          simple={s!r}", flush=True)
+                    prev = s
+                pick_rel = next((r for r, s, _ in transitions if "pick up the container" in s.lower()), None)
+                print(
+                    f"  -> {len(transitions)} phase(s); PICK starts at rel={pick_rel} "
+                    f"(swap windows on ButtonUnmaskSwap: 64/114/164). "
+                    f"completed-before-pick={[s for r, s, _ in transitions if pick_rel is not None and r < pick_rel]}",
+                    flush=True,
+                )
+                out.append({"episode": int(ep), "n_transitions": len(transitions), "pick_rel": pick_rel})
+    return {"task": only_task, "episodes": out}
+
+
+# ---------------------------------------------------------------------------
 # Stage A.2 — SFT warmstart
 # ---------------------------------------------------------------------------
 
@@ -498,7 +598,7 @@ def build_memory_dataset(
 )
 def sft_warmstart(
     dataset_path: str = f"{MOUNT}/data/preprocessed/memory/grounded_subgoal_train.jsonl",
-    output_dir: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    output_dir: str = f"{MOUNT}/ckpts/qwen_sft/permanence_grounded",
     # Hyperparameter rationale (2026-05-28 research synthesis):
     # - Our 6343-row narrow-vocab dataset hit loss 0.25 at step 80 of ~209
     #   with the upstream-recipe values, clearly overfitting.
@@ -518,14 +618,19 @@ def sft_warmstart(
     # v4 log showed ~18GB at per-device 4, so 8 is safe on an 80GB A100.
     per_device_batch_size: int = 8,
     grad_accum: int = 1,
-    # Peak LR drives the collapse. The memory-data run at peak 1e-5 collapsed at
-    # step ~80 (token_acc 0.65→0.50, train AND eval) right as lr decayed through
-    # ~8e-6 — the same onset the v4/v6 saga found (~7-8e-6), with loss still
-    # dropping the whole time. grad_norm stayed sane (~8-30), so this is LR
-    # pressure, not the old multi-GPU mis-normalization. Dropped peak to 4e-6
-    # (below the collapse zone); raise toward 6e-6 only if it underfits.
-    # See project_sft_v4_adapter_degenerate.
-    learning_rate: float = 4e-6,
+    # Peak LR — RAISED to 2e-5 for the MULTI-TASK run (was 4e-6). The vise: on
+    # SINGLE-task narrow data, peak 1e-5 collapsed (~step 80, token_acc 0.65→0.50) as
+    # lr decayed through ~8e-6, so 4e-6 was the only safe single-task value — but 4e-6
+    # UNDERFITS (ckpt-300 emitted a constant ~<315,305> regardless of input,
+    # project_qwen_coordinate_space RESULT). Single-task can't go fast enough to fit
+    # the coordinate without collapsing. The escape is DATA DIVERSITY: multi-task
+    # (ButtonUnmask+VideoUnmask) lifts the collapse threshold (RoboMME ran lr 1e-4
+    # across 1,600 demos, no collapse). 2e-5 is a first step into that regime (5× the
+    # old peak, 5× below RoboMME). MONITOR coord-px-dist per ckpt via
+    # validate_memory_checkpoints, NOT token_acc (template-inflated): back off toward
+    # 1e-5 if it collapses, raise toward 4e-5 if it still underfits.
+    # See project_sft_v4_adapter_degenerate, project_qwen_coordinate_space.
+    learning_rate: float = 2e-5,
     lora_rank: int = 8,
     lora_alpha: int = 16,
 ) -> dict:
@@ -599,19 +704,17 @@ def sft_warmstart(
         "--freeze_aligner", "true",
         "--gradient_checkpointing", "true",
         "--vit_gradient_checkpointing", "false",
-        # save/eval every 25 steps. Over a 5-epoch ~300-step memory run that's ~12
-        # checkpoints — fine granularity to pick the best token_acc and to catch a
-        # late collapse (the v4 onset was ~step 130). save_total_limit 20 keeps them all.
-        "--save_steps", "25",
+        # save/eval every 50 steps (~6 checkpoints over the 5-epoch ~300-step run).
+        "--save_steps", "50",
         # Keep ~all checkpoints (~16 saves over a 1-epoch batch-8 run). v4 collapsed
         # early but --save_total_limit 4 kept only the dead late checkpoints and
         # deleted the good early one; 20 retains the full run so
         # validate_subgoal_checkpoints can pick a coherent one. See
         # project_sft_v4_adapter_degenerate.
         "--save_total_limit", "20",
-        # Evaluate every 25 steps. WATCH token_acc, NOT eval_loss — in the v4
+        # Evaluate every 50 steps. WATCH token_acc, NOT eval_loss — in the v4
         # collapse eval_loss kept dropping while token_acc crashed to 0.
-        "--eval_steps", "25",
+        "--eval_steps", "50",
         "--eval_strategy", "steps",
         "--logging_steps", "10",
         # 4096 (was 3200): the joint SELECT rows show up to 12 candidate frames
@@ -688,7 +791,7 @@ def sft_warmstart(
     secrets=[modal.Secret.from_dotenv(__file__)],
 )
 def validate_subgoal_checkpoints(
-    run_dir: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    run_dir: str = f"{MOUNT}/ckpts/qwen_sft/permanence_grounded",
     task_goal: str = "press the button then pick up the container that hides the red cube",
     max_new_tokens: int = 128,   # MemER JSON output is longer than a bare phrase
 ) -> dict:
@@ -784,24 +887,31 @@ def validate_subgoal_checkpoints(
     secrets=[modal.Secret.from_dotenv(__file__)],
 )
 def validate_memory_checkpoints(
-    run_dir: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    run_dir: str = f"{MOUNT}/ckpts/qwen_sft/permanence_grounded",
     dataset_path: str = f"{MOUNT}/data/preprocessed/memory/grounded_subgoal_train.jsonl",
-    n_samples: int = 6,
+    n_samples: int = 12,
     n_key_frames: int = 4,
     max_new_tokens: int = 128,
 ) -> dict:
-    """Greedy-decode each checkpoint on REAL (4 key + 2 recent) dataset inputs and
-    print the model output next to the target grounded subgoal.
+    """Greedy-decode each checkpoint on REAL dataset inputs and score BOTH heads.
 
-    ``validate_subgoal_checkpoints`` uses a synthetic gray frame with 0 keyframes —
-    a prompt-structure MISMATCH vs the 6-image training prompt, so it only detects
-    collapse, not whether the grounding was learned. This uses the exact training
-    inputs. The key metric is ``mean_coord_px_dist``: small (≲30px ≈ within a
-    container) means the model points at roughly the right container; large/random
-    (~100px) means it learned the template but not the memory.
+    USE head (coordinate): decode the 4-key+2-recent rows and report
+    ``mean_coord_px_dist`` — small (≲30px ≈ within a container) means the model points
+    at roughly the right container; large/random means it learned the template but not
+    the memory. (``validate_subgoal_checkpoints`` uses a synthetic gray frame with 0
+    keyframes — a prompt-structure MISMATCH — so it only detects collapse; this uses
+    the exact training inputs.)
+
+    SELECT head (joint pipeline only): decode the SELECT rows with ``mode="select"``
+    and compare predicted ``keyframe_positions`` to the labeled reveal frames —
+    ``select_mean_jaccard``/``recall`` (higher = picked the right frames) and
+    ``select_n_empty`` (≈ all = the head collapsed to ``[]``, the contradictory-
+    supervision bug the SELECT/USE schema separation fixes). Empty for a --no-joint
+    dataset (no SELECT rows).
     """
     import gc
     import json
+    import os
     import re
 
     import numpy as np
@@ -817,29 +927,99 @@ def validate_memory_checkpoints(
         m = _COORD.search(s or "")
         return (int(m.group(1)), int(m.group(2))) if m else None
 
-    samples = []
+    # One row per DISTINCT episode, restricted to coordinate (USE) rows. The old
+    # "first n_samples rows" took augmentations of the SAME episode (the reported
+    # ckpt-300 read had 5/6 rows sharing target <605,332>), so it could NOT reveal
+    # whether the output VARIES per episode — the whole point of the metric. We key
+    # on the episode id in the image filename ("{env}_ep{idx}_{ts}.png"), keep the
+    # FIRST row per episode (the a==0 canonical even-spacing layout the builder emits
+    # first, which also matches inference), and skip SELECT rows (no coordinate
+    # target). Even-subsample across all episodes so a multi-task dataset
+    # (ButtonUnmask then VideoUnmask in file order) is covered across both tasks.
+    _EP = re.compile(r"^(.*_ep\d+)_\d+\.(?:png|jpg|jpeg)$", re.IGNORECASE)
+
+    def episode_key(row) -> str:
+        for p in row.get("images", []):
+            mm = _EP.search(os.path.basename(p))
+            if mm:
+                return mm.group(1)
+        return ""
+
+    # Classify each row by target: USE rows carry a coordinate (current_subtask),
+    # SELECT rows carry non-empty keyframe_positions and no coordinate. Collect ONE
+    # row per distinct episode for each (the a==0 canonical layout the builder emits
+    # first). SELECT rows are absent in a --no-joint dataset → that section is skipped.
+    seen_use: set = set()
+    seen_sel: set = set()
+    use_rows: list = []
+    sel_rows: list = []
     with open(dataset_path) as f:
         for line in f:
             r = json.loads(line)
-            imgs = [np.asarray(Image.open(p).convert("RGB"), dtype=np.uint8) for p in r["images"]]
-            user = r["messages"][1]["content"]
-            m = re.search(r"The task goal is:\s*(.+)", user)
-            hm = re.search(r"The subtasks already completed are:\s*(.+)", user)
-            history = (
-                [re.sub(r"^\s*\d+\.\s*", "", p.strip()) for p in hm.group(1).split(";") if p.strip()]
-                if hm else []
-            )
-            target_sub, _ = parse_subgoal_output(r["messages"][2]["content"])
-            samples.append({
-                "key": imgs[:n_key_frames],
-                "recent": imgs[n_key_frames:],
-                "task_goal": m.group(1).strip() if m else "",
-                "history": history,
-                "target": target_sub,
-            })
-            if len(samples) >= n_samples:
-                break
-    print(f"[mem-validate] {len(samples)} samples; target example: {samples[0]['target']!r}", flush=True)
+            sub, pos = parse_subgoal_output(r["messages"][2]["content"])
+            ek = episode_key(r)
+            if coord(sub) is not None:           # USE row — coordinate target
+                if ek not in seen_use:
+                    seen_use.add(ek)
+                    use_rows.append(r)
+            elif pos:                            # SELECT row — keyframe_positions, no coord
+                if ek not in seen_sel:
+                    seen_sel.add(ek)
+                    sel_rows.append(r)
+    if not use_rows:
+        raise RuntimeError(f"No coordinate (USE) rows found in {dataset_path}")
+
+    def _even(rows: list) -> list:
+        if len(rows) > n_samples:
+            idx = np.linspace(0, len(rows) - 1, num=n_samples, dtype=int)
+            return [rows[i] for i in idx]
+        return rows
+
+    use_rows = _even(use_rows)
+    sel_rows = _even(sel_rows)
+
+    def _load(paths):
+        return [np.asarray(Image.open(p).convert("RGB"), dtype=np.uint8) for p in paths]
+
+    samples = []
+    for r in use_rows:
+        imgs = _load(r["images"])
+        user = r["messages"][1]["content"]
+        m = re.search(r"The task goal is:\s*(.+)", user)
+        hm = re.search(r"The subtasks already completed are:\s*(.+)", user)
+        history = (
+            [re.sub(r"^\s*\d+\.\s*", "", p.strip()) for p in hm.group(1).split(";") if p.strip()]
+            if hm else []
+        )
+        target_sub, _ = parse_subgoal_output(r["messages"][2]["content"])
+        samples.append({
+            "key": imgs[:n_key_frames],
+            "recent": imgs[n_key_frames:],
+            "task_goal": m.group(1).strip() if m else "",
+            "history": history,
+            "target": target_sub,
+        })
+
+    # SELECT samples: the row's images ARE the candidate window (n_key_frames=0).
+    # We decode mode="select" and compare predicted keyframe_positions to the labeled
+    # reveal frames — the check the coordinate metric can't see.
+    sel_samples = []
+    for r in sel_rows:
+        user = r["messages"][1]["content"]
+        m = re.search(r"The task goal is:\s*(.+)", user)
+        _, tgt_pos = parse_subgoal_output(r["messages"][2]["content"])
+        sel_samples.append({
+            "candidates": _load(r["images"]),
+            "task_goal": m.group(1).strip() if m else "",
+            "target_pos": sorted({int(p) for p in tgt_pos}),
+        })
+
+    print(
+        f"[mem-validate] {len(samples)} USE + {len(sel_samples)} SELECT distinct-episode "
+        f"samples (USE of {len(seen_use)} eps, SELECT of {len(seen_sel)} eps); "
+        f"USE target example: {samples[0]['target']!r}",
+        flush=True,
+    )
 
     base = Path(run_dir)
     versioned = sorted(base.glob("v*-*"))
@@ -853,6 +1033,9 @@ def validate_memory_checkpoints(
         policy = None
         n_grounded = n_empty = 0
         dists = []
+        sel_jacc: list = []
+        sel_rec: list = []
+        sel_empty = 0
         try:
             policy = QwenSubgoalPolicy(adapter_init_path=str(ckpt), device="cuda")
             print(f"\n[mem-validate] === {ckpt.name} ===", flush=True)
@@ -870,6 +1053,25 @@ def validate_memory_checkpoints(
                     if tc is not None:
                         dists.append(((oc[0] - tc[0]) ** 2 + (oc[1] - tc[1]) ** 2) ** 0.5)
                 print(f"  s{i}: OUT={out_sub!r}\n      TGT={s['target']!r}", flush=True)
+            # SELECT head: greedy mode="select" → predicted keyframe_positions vs the
+            # labeled reveal frames. The headline is select_n_empty: empty≈all means the
+            # head collapsed to [] (the contradictory-supervision bug the schema fix kills).
+            for j, s in enumerate(sel_samples):
+                text, _ = policy.greedy_subgoal(
+                    key_frames=[], recent_frames=s["candidates"],
+                    task_goal=s["task_goal"], history_subgoals=[],
+                    max_new_tokens=max_new_tokens, mode="select",
+                )
+                _, pred = parse_subgoal_output(text)
+                ncand = len(s["candidates"])
+                pred_set = {p for p in pred if 1 <= p <= ncand}   # clamp to valid indices
+                tgt_set = set(s["target_pos"])
+                inter = len(pred_set & tgt_set)
+                union = len(pred_set | tgt_set)
+                sel_jacc.append(inter / union if union else 1.0)
+                sel_rec.append(inter / len(tgt_set) if tgt_set else 0.0)
+                sel_empty += 1 if not pred_set else 0
+                print(f"  sel{j}: PRED={sorted(pred_set)} TGT={sorted(tgt_set)}", flush=True)
         except Exception as exc:
             print(f"[mem-validate] {ckpt.name}: ERROR {exc!r}", flush=True)
             results.append({"checkpoint": ckpt.name, "error": repr(exc)[:200]})
@@ -879,16 +1081,216 @@ def validate_memory_checkpoints(
             gc.collect()
             torch.cuda.empty_cache()
         mean_dist = float(np.mean(dists)) if dists else None
-        results.append({
+        result = {
             "checkpoint": ckpt.name, "n_grounded": n_grounded, "n_empty": n_empty,
             "n_samples": len(samples), "mean_coord_px_dist": mean_dist,
-        })
+        }
         print(
             f"[mem-validate] {ckpt.name}: grounded {n_grounded}/{len(samples)}, "
             f"empty {n_empty}, mean coord px-dist={mean_dist}",
             flush=True,
         )
+        if sel_samples:
+            mean_jacc = float(np.mean(sel_jacc))
+            mean_rec = float(np.mean(sel_rec))
+            result.update({
+                "select_mean_jaccard": mean_jacc,
+                "select_mean_recall": mean_rec,
+                "select_n_empty": sel_empty,
+                "n_select_samples": len(sel_samples),
+            })
+            print(
+                f"[mem-validate] {ckpt.name}: SELECT jaccard={mean_jacc:.3f} "
+                f"recall={mean_rec:.3f} empty={sel_empty}/{len(sel_samples)} "
+                "(empty≈all → SELECT head collapsed to []; the schema fix should prevent it)",
+                flush=True,
+            )
+        results.append(result)
     return {"run": str(run), "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Stage A.3c — Cube-visibility diagnostic (can the VLM SEE the cubes at all?)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=1 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def probe_cube_visibility(
+    dataset_path: str = f"{MOUNT}/data/preprocessed/memory/grounded_subgoal_train.jsonl",
+    n_samples: int = 4,
+    adapter_path: str = "",   # "" = BASE Qwen3-VL (no SFT); else a checkpoint dir
+) -> dict:
+    """Ask the VLM directly what cubes it sees + where, on a real reveal keyframe.
+
+    The constant-coordinate SFT failure (``<100,100>`` for every episode) means the
+    model ignores the keyframes. This isolates WHY: if the model can name the cube
+    colours + rough pixel locations here, the keyframes ARE usable and the fix is to
+    stop forcing pixel REGRESSION (give candidate container coords → select). If it
+    can't, the keyframes are unusable (resolution/clarity) and we fix the inputs.
+    Defaults to the BASE model so we test the VLM's raw perception, not the adapter.
+    """
+    import json
+
+    import torch
+    from PIL import Image
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+    model_id = "Qwen/Qwen3-VL-4B-Instruct"
+    proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_id, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+        device_map="cuda", trust_remote_code=True,
+    )
+    if adapter_path:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, adapter_path)
+    model.eval()
+
+    # Take USE rows (grounded coordinate targets); their first image is a reveal keyframe.
+    rows = []
+    with open(dataset_path) as f:
+        for line in f:
+            r = json.loads(line)
+            if "container at <" in r["messages"][2]["content"]:
+                rows.append(r)
+            if len(rows) >= n_samples:
+                break
+
+    question = (
+        "This is a 256x256 robot camera image. A few containers each briefly reveal a "
+        "colored cube (red, green, and/or blue) underneath. For EACH cube you can see, "
+        "give its colour and its approximate pixel location as (x, y). If you cannot make "
+        "out any cubes, say 'no cubes visible'."
+    )
+    results = []
+    for i, r in enumerate(rows):
+        kf = r["images"][0]
+        img = Image.fromarray(__import__("numpy").asarray(Image.open(kf).convert("RGB")))
+        messages = [
+            {"role": "system", "content": "You are a precise visual grounding assistant."},
+            {"role": "user", "content": f"<image>{question}"},
+        ]
+        chat_text = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        chat_text = chat_text.replace("<image>", "<|vision_start|><|image_pad|><|vision_end|>")
+        inputs = proc(text=[chat_text], images=[img], return_tensors="pt", padding=True).to("cuda")
+        with torch.no_grad():
+            gen = model.generate(**inputs, max_new_tokens=160, do_sample=False)
+        ans = proc.tokenizer.decode(
+            gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        ).strip()
+        tgt = r["messages"][2]["content"]
+        print(f"[cube-probe] sample{i} kf={kf}\n  TARGET (true container coord): {tgt}\n  VLM SEES: {ans}\n", flush=True)
+        results.append({"keyframe": kf, "target": tgt, "answer": ans})
+    return {"adapter": adapter_path or "BASE", "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Stage A.4 — Held-out VLM rollout probe (the gate before GRPO)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=4 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def probe_vlm_rollout(
+    adapter_path: str = f"{MOUNT}/ckpts/qwen_sft/permanence_grounded",
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    task: str = "ButtonUnmask",
+    episodes: int = 12,
+    seed: int = 20260601,        # held-out base, distinct from training demos / GRPO seed=0
+    rollout_max_steps: int = 400,
+) -> dict:
+    """Boot GroundSG and roll out the SFT'd VLM's greedy subgoal on HELD-OUT seeds.
+
+    The gate before GRPO. ``validate_memory_checkpoints`` proved the VLM conditions
+    on the keyframes on TRAIN rows; this runs the full inference path (peek →
+    greedy subgoal → ``coords.from_qwen_xy`` → GroundSG) on unseen seeds and checks
+    the three things GRPO needs: VLM success > 0 (bootstrap), VLM ≈ oracle ceiling
+    (generalizes), VLM > coordinate-shifted contrast (the grounding + conversion are
+    load-bearing). Exit 0 / ``proceed:True`` means launch GRPO; nonzero means fix the
+    SFT ckpt / conversion first. Pin a checkpoint with ``--adapter-path .../checkpoint-N``.
+    See ``probe_vlm_rollout.py``.
+    """
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting GroundSG π0.5 server on localhost:{port} …")
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}",
+            f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app",
+        env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("GroundSG policy server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("GroundSG server is up.")
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("GroundSG policy server did not become reachable")
+
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    Path(hf_cache_dir).mkdir(parents=True, exist_ok=True)
+    probe_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        # CPU rendering for the simulator (same as the GRPO/eval container).
+        "SAPIEN_RENDER_DEVICE": "cpu",
+        "MUJOCO_GL": "osmesa",
+        # Reuse the volume-cached Qwen weights (same strategy as SFT/GRPO).
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+    }
+    cmd = [
+        "micromamba", "run", "-n", "robomme",
+        "python", "-u", "/workspace/src/vla_memory/grpo/probe_vlm_rollout.py",
+        f"--port={port}",
+        f"--adapter-path={adapter_path}",
+        f"--task={task}",
+        f"--episodes={episodes}",
+        f"--seed={seed}",
+        f"--rollout-max-steps={rollout_max_steps}",
+    ]
+    import shlex
+    print("Launching held-out VLM rollout probe:", shlex.join(cmd), flush=True)
+    rc = 1
+    try:
+        proc = subprocess.run(cmd, env=probe_env, cwd="/workspace")
+        rc = proc.returncode
+    finally:
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+    return {"task": task, "episodes": episodes, "adapter": adapter_path,
+            "probe_exit_code": rc, "proceed": rc == 0}
 
 
 # ---------------------------------------------------------------------------
@@ -907,7 +1309,7 @@ def grpo(
     # resolver accepts a swift output_dir (auto-picks the latest v*/checkpoint-*) or
     # a specific checkpoint-N dir. Override at the CLI once SFT completes:
     #   modal run modal_train.py::grpo --sft-adapter-path /mnt/.../checkpoint-N
-    sft_adapter_path: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    sft_adapter_path: str = f"{MOUNT}/ckpts/qwen_sft/permanence_grounded",
     # GroundSG (subgoal-conditioned) π0.5 — NOT pi05_baseline, which discards the
     # subgoal (project_pi05_baseline_ignores_subgoal). create_trained_policy reads
     # symbolic-grounded-subgoal/history_config.txt (next to the ckpt) and activates
@@ -1063,8 +1465,9 @@ def main(stage: str = "grpo"):
         modal run modal_train.py --stage download_groundsg # subgoal-conditioned π0.5 (~GB)
         modal run modal_train.py --stage causality_probe   # BLOCKER check: does π0.5 read the subgoal?
         modal run modal_train.py --stage build_dataset    # H5 -> QwenVL JSONL (simple subgoal)
-        modal run modal_train.py --stage build_memory     # H5 -> memory SFT JSONL (ButtonUnmask grounded)
+        modal run modal_train.py --stage build_memory     # H5 -> memory SFT JSONL (Permanence: ButtonUnmask+VideoUnmask grounded)
         modal run modal_train.py --stage sft              # SFT warmstart (memory data)
+        modal run modal_train.py --stage probe_vlm        # held-out VLM rollout gate (pre-GRPO)
         modal run modal_train.py --stage grpo             # GRPO fine-tune
     """
     if stage == "download_data":
@@ -1077,8 +1480,12 @@ def main(stage: str = "grpo"):
         print(build_dataset.remote())
     elif stage == "build_memory":
         print(build_memory_dataset.remote())
+    elif stage == "inspect_swap":
+        print(inspect_swap_demos.remote())
     elif stage == "sft":
         print(sft_warmstart.remote())
+    elif stage == "probe_vlm":
+        print(probe_vlm_rollout.remote())
     elif stage == "grpo":
         print(grpo.remote())
     else:

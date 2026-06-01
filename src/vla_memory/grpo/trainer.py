@@ -383,6 +383,7 @@ class GRPOTrainer:
             top_p=self.cfg.sample_top_p,
             has_video_demo=state.has_video_demo,
             debug=self.cfg.debug_subgoals,
+            mode="select",   # distinct SELECT prompt/schema → emits keyframe_positions only
         )
         recent_base = [dp.current_frame] if dp.current_frame is not None else []
         trajectories: List[Trajectory] = []

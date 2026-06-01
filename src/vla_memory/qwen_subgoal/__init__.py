@@ -8,6 +8,7 @@ directly when you need it::
 """
 
 from .prompts import (
+    SELECT_SYSTEM_PROMPT,
     SUBGOAL_SYSTEM_PROMPT,
     build_messages,
     build_user_prompt,
@@ -16,6 +17,7 @@ from .prompts import (
 
 __all__ = [
     "SUBGOAL_SYSTEM_PROMPT",
+    "SELECT_SYSTEM_PROMPT",
     "build_messages",
     "build_user_prompt",
     "parse_subgoal_output",

@@ -1052,6 +1052,241 @@ def grpo(
 
 
 # ---------------------------------------------------------------------------
+# Stage B.1 — PPO (bandit variant with learned value baseline)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=24 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def ppo(
+    sft_adapter_path: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    output_dir: str = f"{MOUNT}/runs/ppo/buttonunmask_groundsg_v0",
+    num_steps: int = 200,
+    batch_states: int = 4,
+    rollouts_per_state: int = 8,
+    coeff_vf: float = 0.5,
+    learning_rate: float = 1e-4,
+    sample_temperature: float = 1.0,
+    rollouts_per_subgoal: int = 1,
+    rollout_max_steps: int = 200,
+    only_tasks: str = "ButtonUnmask",
+    episodes_per_task: int = 20,
+    subgoal_type: str = "grounded_subgoal",
+    seed: int = 0,
+    debug_subgoals: bool = False,
+) -> dict:
+    """PPO with a learned value baseline instead of GRPO's group mean.
+
+    Same infra as GRPO: frozen π0.5 server + micromamba robomme env for the
+    PPO loop. The PPOTrainer adds a ValueHead to QwenSubgoalPolicy and trains
+    it jointly with the LoRA adapter.
+    """
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting frozen π0.5 server on localhost:{port} …")
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}",
+            f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app",
+        env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("π0.5 policy server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("π0.5 server is up.")
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("π0.5 policy server did not become reachable")
+
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    Path(hf_cache_dir).mkdir(parents=True, exist_ok=True)
+    ppo_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "vla-memory-ppo"),
+        "WANDB_RUN_NAME": f"qwen-ppo-{int(time.time())}",
+    }
+    ppo_cmd = [
+        "micromamba", "run", "-n", "robomme",
+        "python", "-u", "/workspace/src/vla_memory/ppo/main.py",
+        f"--port={port}",
+        f"--sft-adapter-path={sft_adapter_path}",
+        f"--output-dir={output_dir}",
+        f"--num-steps={num_steps}",
+        f"--batch-states={batch_states}",
+        f"--rollouts-per-state={rollouts_per_state}",
+        f"--coeff-vf={coeff_vf}",
+        f"--learning-rate={learning_rate}",
+        f"--sample-temperature={sample_temperature}",
+        f"--rollouts-per-subgoal={rollouts_per_subgoal}",
+        f"--rollout-max-steps={rollout_max_steps}",
+        f"--only-tasks={only_tasks}",
+        f"--episodes-per-task={episodes_per_task}",
+        f"--subgoal-type={subgoal_type}",
+        f"--seed={seed}",
+    ]
+    if debug_subgoals:
+        ppo_cmd.append("--debug-subgoals")
+    import shlex
+    print("Launching PPO main loop:", shlex.join(ppo_cmd), flush=True)
+    try:
+        subprocess.run(ppo_cmd, check=True, env=ppo_env, cwd="/workspace")
+    finally:
+        try:
+            volume.commit()
+        except Exception as commit_exc:
+            print(f"[ppo] volume.commit() failed: {commit_exc!r}", flush=True)
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+    return {"output_dir": output_dir, "log_path": str(Path(output_dir) / "train_log.jsonl")}
+
+
+# ---------------------------------------------------------------------------
+# Stage B.2 — RLOO (REINFORCE Leave-One-Out ablation)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=24 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def rloo(
+    sft_adapter_path: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    output_dir: str = f"{MOUNT}/runs/rloo/buttonunmask_groundsg_v0",
+    num_steps: int = 200,
+    batch_states: int = 4,
+    group_size: int = 8,
+    kl_beta: float = 0.0,
+    learning_rate: float = 1e-4,
+    sample_temperature: float = 1.0,
+    rollouts_per_subgoal: int = 1,
+    rollout_max_steps: int = 200,
+    only_tasks: str = "ButtonUnmask",
+    episodes_per_task: int = 20,
+    subgoal_type: str = "grounded_subgoal",
+    seed: int = 0,
+    debug_subgoals: bool = False,
+) -> dict:
+    """RLOO ablation: same as GRPO but leave-one-out advantage instead of group mean."""
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting frozen π0.5 server on localhost:{port} …")
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}",
+            f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app",
+        env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("π0.5 policy server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("π0.5 server is up.")
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("π0.5 policy server did not become reachable")
+
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    Path(hf_cache_dir).mkdir(parents=True, exist_ok=True)
+    rloo_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "vla-memory-rloo"),
+        "WANDB_RUN_NAME": f"qwen-rloo-{int(time.time())}",
+    }
+    rloo_cmd = [
+        "micromamba", "run", "-n", "robomme",
+        "python", "-u", "/workspace/src/vla_memory/rloo/main.py",
+        f"--port={port}",
+        f"--sft-adapter-path={sft_adapter_path}",
+        f"--output-dir={output_dir}",
+        f"--num-steps={num_steps}",
+        f"--batch-states={batch_states}",
+        f"--group-size={group_size}",
+        f"--kl-beta={kl_beta}",
+        f"--learning-rate={learning_rate}",
+        f"--sample-temperature={sample_temperature}",
+        f"--rollouts-per-subgoal={rollouts_per_subgoal}",
+        f"--rollout-max-steps={rollout_max_steps}",
+        f"--only-tasks={only_tasks}",
+        f"--episodes-per-task={episodes_per_task}",
+        f"--subgoal-type={subgoal_type}",
+        f"--seed={seed}",
+    ]
+    if debug_subgoals:
+        rloo_cmd.append("--debug-subgoals")
+    import shlex
+    print("Launching RLOO main loop:", shlex.join(rloo_cmd), flush=True)
+    try:
+        subprocess.run(rloo_cmd, check=True, env=rloo_env, cwd="/workspace")
+    finally:
+        try:
+            volume.commit()
+        except Exception as commit_exc:
+            print(f"[rloo] volume.commit() failed: {commit_exc!r}", flush=True)
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+    return {"output_dir": output_dir, "log_path": str(Path(output_dir) / "train_log.jsonl")}
+
+
+# ---------------------------------------------------------------------------
 # Local entrypoint convenience
 # ---------------------------------------------------------------------------
 
@@ -1065,7 +1300,9 @@ def main(stage: str = "grpo"):
         modal run modal_train.py --stage build_dataset    # H5 -> QwenVL JSONL (simple subgoal)
         modal run modal_train.py --stage build_memory     # H5 -> memory SFT JSONL (ButtonUnmask grounded)
         modal run modal_train.py --stage sft              # SFT warmstart (memory data)
-        modal run modal_train.py --stage grpo             # GRPO fine-tune
+        modal run modal_train.py --stage grpo             # GRPO fine-tune (Lucas)
+        modal run modal_train.py --stage ppo              # PPO with learned value baseline
+        modal run modal_train.py --stage rloo             # RLOO ablation (leave-one-out advantage)
     """
     if stage == "download_data":
         print(download_demonstrations.remote())
@@ -1081,5 +1318,9 @@ def main(stage: str = "grpo"):
         print(sft_warmstart.remote())
     elif stage == "grpo":
         print(grpo.remote())
+    elif stage == "ppo":
+        print(ppo.remote())
+    elif stage == "rloo":
+        print(rloo.remote())
     else:
         raise SystemExit(f"unknown stage: {stage}")

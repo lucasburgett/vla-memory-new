@@ -38,6 +38,24 @@ os.environ.setdefault("FPS_MAX_FRAMES", "10")
 _MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 
 
+class ValueHead(torch.nn.Module):
+    """Scalar value head for PPO: last-token hidden state → V(state).
+
+    Kept in float32 (not bfloat16) so MSE gradients are numerically stable.
+    Initialized to zero so V starts as a flat 0 baseline — equivalent to
+    a REINFORCE-style update at step 0, letting it warm up gradually.
+    """
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(hidden_size, 1, bias=True)
+        torch.nn.init.zeros_(self.linear.weight)
+        torch.nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x.float()).squeeze(-1)
+
+
 @dataclasses.dataclass
 class SampleResult:
     """One sampled subgoal candidate plus the bookkeeping GRPO needs."""
@@ -131,6 +149,9 @@ class QwenSubgoalPolicy:
             trust_remote_code=True,
         )
         base.config.use_cache = True
+
+        # Value head for PPO (GRPO ignores it; overhead is one tiny linear layer).
+        self.value_head = ValueHead(base.config.hidden_size).to(device)
 
         if adapter_init_path is not None:
             # Warm-start the policy from the SFT'd LoRA adapter, and load a
@@ -487,6 +508,49 @@ class QwenSubgoalPolicy:
     # Persistence
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Value function (PPO only)
+    # ------------------------------------------------------------------
+
+    def get_value(
+        self,
+        prompt_input_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute V(state) from the prompt's last-token hidden state.
+
+        Uses torch.no_grad for the model forward so LoRA params receive no
+        gradient from the value loss — only the ValueHead linear layer
+        accumulates gradient. Returns a scalar tensor with grad_fn rooted at
+        value_head.linear.
+
+        Called once per state (not per candidate), so the overhead of the
+        extra forward pass is bounded.
+        """
+        self.model.set_adapter("policy")
+        self.model.eval()
+
+        prompt_len = prompt_input_ids.shape[0]
+        kwargs: dict = dict(
+            input_ids=prompt_input_ids.unsqueeze(0).to(self.device),
+            attention_mask=prompt_attention_mask.unsqueeze(0).to(self.device),
+            output_hidden_states=True,
+        )
+        if pixel_values.numel() > 0:
+            kwargs["pixel_values"] = pixel_values.to(self.device, dtype=self.dtype)
+            kwargs["image_grid_thw"] = image_grid_thw.to(self.device)
+
+        with torch.no_grad():
+            out = self.model(**kwargs)
+
+        # Take the last layer's hidden state at the last prompt position.
+        # .clone() materialises outside the no_grad scope so value_head can
+        # build a grad graph rooted at value_head.linear (not the LM).
+        last_hidden = out.hidden_states[-1][0, prompt_len - 1, :].clone()
+        return self.value_head(last_hidden)  # scalar, grad flows to value_head
+
     def activate_policy(self) -> None:
         """Make the trainable 'policy' adapter the active one.
 
@@ -504,8 +568,18 @@ class QwenSubgoalPolicy:
         self.model.set_adapter("policy")
         self.model.save_pretrained(out_dir, selected_adapters=["policy"])
 
+    def save_value_head(self, out_dir: str) -> None:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        torch.save(self.value_head.state_dict(), Path(out_dir) / "value_head.pt")
+
+    def load_value_head(self, path: str) -> None:
+        self.value_head.load_state_dict(
+            torch.load(path, map_location=self.device, weights_only=True)
+        )
+
     def trainable_parameters(self) -> List[torch.nn.Parameter]:
-        return [p for p in self.model.parameters() if p.requires_grad]
+        lora_params = [p for p in self.model.parameters() if p.requires_grad]
+        return lora_params + list(self.value_head.parameters())
 
 
-__all__ = ["QwenSubgoalPolicy", "SampleResult"]
+__all__ = ["QwenSubgoalPolicy", "SampleResult", "ValueHead"]

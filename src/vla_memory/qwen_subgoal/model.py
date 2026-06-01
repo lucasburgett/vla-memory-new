@@ -151,7 +151,9 @@ class QwenSubgoalPolicy:
         base.config.use_cache = True
 
         # Value head for PPO (GRPO ignores it; overhead is one tiny linear layer).
-        self.value_head = ValueHead(base.config.hidden_size).to(device)
+        # Qwen3VLConfig nests the LM hidden size under text_config, not top-level.
+        _hidden_size = getattr(base.config, "hidden_size", None) or base.config.text_config.hidden_size
+        self.value_head = ValueHead(_hidden_size).to(device)
 
         if adapter_init_path is not None:
             # Warm-start the policy from the SFT'd LoRA adapter, and load a

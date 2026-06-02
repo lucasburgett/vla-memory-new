@@ -59,7 +59,7 @@ class PPOConfig:
     rollouts_per_subgoal: int = 1   # >1 averages reward to cut π0.5 noise
     seed_match_group: bool = True   # pin env seed across rollouts per state
     log_every: int = 1
-    save_every: int = 25
+    save_every: int = 10
     output_dir: str = "runs/ppo"
     seed: int = 0
     debug_subgoals: bool = False

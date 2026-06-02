@@ -1300,7 +1300,7 @@ def rloo(
     secrets=[modal.Secret.from_dotenv(__file__)],
 )
 def evaluate(
-    adapter_path: str = f"{MOUNT}/runs/ppo/buttonunmask_50steps/step50",
+    adapter_path: str = "",  # empty string = zero-shot (base Qwen, no LoRA)
     low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
     policy_config: str = "mme_vla_suite",
     task: str = "ButtonUnmask",
@@ -1375,8 +1375,9 @@ from vla_memory.grpo.reward import RewardConfig, compute_reward
 from vla_memory.grpo.rollout import RolloutWorker
 from openpi_client import websocket_client_policy as _wp
 
+_adapter = "{adapter_path}" or None
 policy = QwenSubgoalPolicy(
-    adapter_init_path="{adapter_path}",
+    adapter_init_path=_adapter,
     torch_dtype=torch.bfloat16,
     device="cuda",
 )

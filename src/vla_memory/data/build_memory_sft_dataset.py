@@ -71,6 +71,8 @@ class MemorySFTBuilder:
         n_candidate_frames: int = 12,
         max_keyframes: int = 4,
         also_select: bool = True,
+        streaming: bool = False,
+        keyframe_buffer_cap: int = 8,
         seed: int = 0,
         max_episodes: Optional[int] = None,
     ) -> None:
@@ -82,7 +84,12 @@ class MemorySFTBuilder:
         self.augment_factor = max(1, augment_factor)
         self.n_candidate_frames = n_candidate_frames
         self.max_keyframes = max_keyframes
-        self.also_select = also_select   # also emit SELECT rows for the joint pipeline
+        # streaming = MemER-faithful SINGLE-call rows ({current_subtask, keyframe_positions}
+        # BOTH populated), with the keyframe buffer carried across picks. Supersedes the
+        # two-call SELECT/USE rows; when set, also_select is ignored (no separate SELECT row).
+        self.streaming = streaming
+        self.keyframe_buffer_cap = keyframe_buffer_cap
+        self.also_select = also_select and not streaming
         self.max_episodes = max_episodes
         self._rng = random.Random(seed)
 
@@ -157,30 +164,167 @@ class MemorySFTBuilder:
         if len(captured) < 2:
             return 0
 
-        # Decision point = the first PICK frame (the post-occlusion memory choice).
-        # Detect the pick subgoal DIRECTLY rather than "first subgoal change": a
-        # multi-phase task like ButtonUnmaskSwap presses TWO buttons, so the first
-        # change is press1→press2 (~step 64) — before the containers finish swapping
-        # and long before the pick. The pick subgoal carries the remembered-container
-        # grounding we train on. For single-button ButtonUnmask this resolves to the
-        # SAME frame as before (press→pick is the only transition), so non-Swap
-        # behavior + prompt parity are unchanged.
-        decision_ts = next(
-            (ts for ts in captured if "pick up the container" in simple_online(ts)), None
-        )
-        if decision_ts is None:
+        # All PICK decision points. A multi-pick task (ButtonUnmaskSwap picks blue THEN
+        # green) has several; each is its own memory decision + SFT row-set so joint GRPO
+        # earns reward on every pick. Detect the START of each distinct "pick up the
+        # container ..." phase (single-pick tasks yield exactly one).
+        pick_starts: List[int] = []
+        prev = None
+        for ts in captured:
+            s = simple_online(ts)
+            if "pick up the container" in s and s != prev:
+                pick_starts.append(ts)
+            prev = s
+        if not pick_starts:
             return 0
 
-        # Completed subtasks before the pick (the timing signal): distinct non-pick
-        # simple subgoals seen so far, in order. ButtonUnmask → ["press the button"];
-        # ButtonUnmaskSwap → ["press the first button", "press the second button"].
-        # MUST match rollout._warmup's history for prompt parity.
+        # Frame cache shared across picks + augmentations (each frame written once).
+        saved: dict = {}
+
+        def save(ts: int) -> str:
+            if ts not in saved:
+                saved[ts] = self._save_frame(episode_data, env_id, episode_idx, ts)
+            return saved[ts]
+
+        if self.streaming:
+            return self._emit_episode_streaming(
+                episode_data, task_goal, captured, pick_starts, simple_online, save
+            )
+
+        n_rows = 0
+        for decision_ts in pick_starts:
+            n_rows += self._emit_pick(
+                episode_data, task_goal, captured, decision_ts, simple_online, save
+            )
+        return n_rows
+
+    def _emit_episode_streaming(
+        self,
+        episode_data,
+        task_goal: str,
+        captured: List[int],
+        pick_starts: List[int],
+        simple_online,
+        save,
+    ) -> int:
+        """Emit the MemER single-call STREAMING rows for one episode.
+
+        One row per (pick, augment): a single MemER call with key_frames = the keyframe
+        buffer the streaming rollout would hold at that pick (empty at pick 0; the prior
+        picks' nominations after, accumulated + capped) and recent_frames = this pick's
+        broad window. Target = ``{current_subtask, keyframe_positions}`` with BOTH fields
+        populated. The buffer is threaded across picks so SFT mirrors the streaming
+        rollout (rollout.rollout_streaming): pick 0's window spans reveal→swaps so its
+        nominations capture the memory; pick i>0's window is occluded so grounding must
+        come from the buffer. Mirrors trainer._streaming_group's prompt structure (parity).
+        """
+        # Split captured into per-pick windows at the pick boundaries: pick 0 spans
+        # reveal→pick0 (cube-visible); pick i>0 spans (pick(i-1)_start, pick_i] (occluded),
+        # matching the streaming rollout's window_start advancing past each completed pick.
+        windows: List[List[int]] = []
+        prev = None
+        for ds in pick_starts:
+            if prev is None:
+                windows.append([ts for ts in captured if ts <= ds])
+            else:
+                windows.append([ts for ts in captured if prev < ts <= ds])
+            prev = ds
+
+        n_rows = 0
+        buffer_paths: List[str] = []   # the keyframe buffer the rollout holds at this pick
+        for decision_ts, window in zip(pick_starts, windows):
+            if not window:
+                continue
+            # History = distinct completed subtasks before THIS pick (parity with
+            # rollout._history_before_pick); on Swap pick 1 it includes the completed pick 0.
+            history: List[str] = []
+            for ts in captured:
+                if ts >= decision_ts:
+                    break
+                sg = simple_online(ts)
+                if sg and sg not in history:
+                    history.append(sg)
+            written, next_buffer = self._emit_pick_streaming(
+                episode_data, task_goal, window, history, decision_ts, simple_online, save, buffer_paths
+            )
+            n_rows += written
+            # Accumulate the buffer across picks (MemER), capped — most-recent picks' frames.
+            buffer_paths = (buffer_paths + next_buffer)[-self.keyframe_buffer_cap:]
+        return n_rows
+
+    def _emit_pick_streaming(
+        self,
+        episode_data,
+        task_goal: str,
+        window: List[int],
+        history: List[str],
+        decision_ts: int,
+        simple_online,
+        save,
+        buffer_paths: List[str],
+    ) -> Tuple[int, List[str]]:
+        """Emit the streaming rows for ONE pick. Returns (n_written, next_buffer_paths)
+        where next_buffer_paths = the frames this pick nominates (a=0 even-spacing,
+        inference-matching), to carry into the next pick's buffer."""
+        grounded = (
+            episode_data[f"timestep_{decision_ts}"]["info"]["grounded_subgoal_online"][()]
+            .decode()
+            .strip()
+        )
+        if not grounded:
+            return 0, []
+        grounded = _HIDES_SUFFIX.sub("", grounded).strip()
+        grounded = _to_qwen_xy(grounded)   # <y,x> 0–255 px → Qwen-native <x,y> 0–1000
+
+        n = len(window)
+        important_ts = self._memer_important(episode_data, window, simple_online)
+
+        next_buffer: List[str] = []
+        n_written = 0
+        for a in range(self.augment_factor):
+            cand_pos = self._candidate_window(n, a)
+            cand_ts = [window[p] for p in cand_pos]
+            cand_paths = [save(ts) for ts in cand_ts]
+            sel_label = self._memer_label(cand_ts, important_ts)
+            user = build_user_prompt(
+                task_goal=task_goal,
+                n_key_frames=len(buffer_paths),
+                n_recent_frames=len(cand_paths),
+                history_subgoals=history,
+                has_video_demo=False,
+            )
+            # The MemER single-call target: BOTH current_subtask AND keyframe_positions.
+            assistant = json.dumps({"current_subtask": grounded, "keyframe_positions": sel_label})
+            self._write_row(user, assistant, buffer_paths + cand_paths)
+            n_written += 1
+            if a == 0:
+                next_buffer = [cand_paths[p - 1] for p in sel_label]
+        return n_written, next_buffer
+
+    def _emit_pick(
+        self,
+        episode_data,
+        task_goal: str,
+        captured: List[int],
+        decision_ts: int,
+        simple_online,
+        save,
+    ) -> int:
+        """Emit the USE (+ SELECT, if joint) rows for ONE pick at ``decision_ts``.
+
+        The oracle drives earlier picks at rollout time, so each pick is an independent
+        memory decision — its own keyframes, grounded target, and completed history.
+        """
+        # History = distinct completed subtasks before THIS pick (presses + earlier
+        # picks + put-downs). On Swap pick 2 this INCLUDES the completed pick 1 → the
+        # prompt tells the model which colour it's now on. MUST match
+        # rollout._history_before_pick for prompt parity.
         history: List[str] = []
         for ts in captured:
             if ts >= decision_ts:
                 break
             sg = simple_online(ts)
-            if sg and "pick up the container" not in sg and sg not in history:
+            if sg and sg not in history:
                 history.append(sg)
 
         grounded = (
@@ -191,11 +335,8 @@ class MemorySFTBuilder:
         if not grounded:
             return 0
         # Coordinate-focused target: drop "that hides the {colour} cube" so the
-        # coordinate (the memory output) is the dominant, only-variable span. The
-        # model can't earn token_acc by copying the colour phrase from the task
-        # goal — it MUST produce the coordinate; token_acc now reflects coordinate
-        # accuracy. Colour stays in the PROMPT (task spec: which cube). GroundSG is
-        # coordinate-driven (probe: colour-insensitive), so the shorter subgoal is fine.
+        # coordinate (the memory output) is the dominant, only-variable span; colour
+        # stays in the PROMPT. GroundSG is coordinate-driven (probe: colour-insensitive).
         grounded = _HIDES_SUFFIX.sub("", grounded).strip()
         grounded = _to_qwen_xy(grounded)   # <y,x> 0–255 px → Qwen-native <x,y> 0–1000
 
@@ -205,23 +346,12 @@ class MemorySFTBuilder:
         recent_ts = window[max(0, n - self.n_recent_frames):]
         if not recent_ts:
             return 0
-
-        # Cache so a frame reused across augmentations is written once.
-        saved: dict = {}
-
-        def save(ts: int) -> str:
-            if ts not in saved:
-                saved[ts] = self._save_frame(episode_data, env_id, episode_idx, ts)
-            return saved[ts]
-
         recent_paths = [save(ts) for ts in recent_ts]
 
-        # Memer-style "important" timesteps over the pre-pick window (computed once
-        # per episode): subgoal transitions + action-velocity minima. The SELECT label
-        # points the kept keyframes at the candidates nearest these. RoboMME's own
-        # keyframe definition; on Swap the transitions align with the container swaps,
-        # so the kept frames span reveal→swaps (what the USE call needs to deduce the
-        # post-swap container position) — the reveal-window heuristic missed them.
+        # Memer-style "important" timesteps over THIS pick's pre-decision window:
+        # subgoal transitions + action-velocity minima. On Swap the transitions align
+        # with the container swaps, so the kept frames span reveal→swaps (what the USE
+        # call needs to deduce the post-swap container position).
         important_ts = self._memer_important(episode_data, window, simple_online)
 
         n_written = 0
@@ -429,6 +559,8 @@ def build_memory_sft_dataset(
     n_candidate_frames: int = 12,
     max_keyframes: int = 4,
     also_select: bool = True,
+    streaming: bool = False,
+    keyframe_buffer_cap: int = 8,
     seed: int = 0,
     max_episodes: Optional[int] = None,
 ) -> dict:
@@ -444,6 +576,8 @@ def build_memory_sft_dataset(
         n_candidate_frames=n_candidate_frames,
         max_keyframes=max_keyframes,
         also_select=also_select,
+        streaming=streaming,
+        keyframe_buffer_cap=keyframe_buffer_cap,
         seed=seed,
         max_episodes=max_episodes,
     )

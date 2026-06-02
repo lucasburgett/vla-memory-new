@@ -14,6 +14,36 @@ from typing import List, Sequence
 import numpy as np
 
 
+def valid_keyframe_positions(
+    keyframe_positions: Sequence[int],
+    n_candidates: int,
+    max_keyframes: int,
+) -> List[int]:
+    """The 1-indexed positions ``apply_selection`` keeps: in-range, deduped, in
+    original order, capped at ``max_keyframes``.
+
+    Pure index logic, so callers can map the kept positions to BOTH frames and
+    their step tags (the streaming rollout needs the abs-step of each kept frame to
+    cluster the keyframe buffer). Defensive against free-form generation: non-ints
+    and out-of-range / duplicate indices are dropped.
+    """
+    if n_candidates <= 0 or max_keyframes <= 0:
+        return []
+    seen: set[int] = set()
+    out: List[int] = []
+    for p in keyframe_positions:
+        try:
+            idx = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= idx <= n_candidates and idx not in seen:
+            seen.add(idx)
+            out.append(idx)
+            if len(out) >= max_keyframes:
+                break
+    return out
+
+
 def apply_selection(
     keyframe_positions: Sequence[int],
     candidates: Sequence[np.ndarray],
@@ -22,29 +52,16 @@ def apply_selection(
     """Map 1-indexed ``keyframe_positions`` to the selected candidate frames.
 
     MemER convention: positions are 1-indexed into ``candidates`` (the frames the
-    VLM was shown). We are defensive because the positions come from free-form
-    generation: non-integers and out-of-range / duplicate indices are dropped,
-    original order is preserved, and the result is capped at ``max_keyframes``
-    (keep the first valid ones). An empty / all-invalid selection returns ``[]``
-    — the USE call then has no memory and should fail, which is the correct
-    (negative) training signal, not an error.
+    VLM was shown). An empty / all-invalid selection returns ``[]`` — the call then
+    has no memory and should fail, which is the correct (negative) training signal,
+    not an error. Delegates the index validation to ``valid_keyframe_positions`` so
+    the streaming path (which also needs the kept positions for step-tagging) and
+    this frame mapping share one source of truth.
     """
-    if not candidates or max_keyframes <= 0:
+    if not candidates:
         return []
-    n = len(candidates)
-    seen: set[int] = set()
-    out: List[np.ndarray] = []
-    for p in keyframe_positions:
-        try:
-            idx = int(p)
-        except (TypeError, ValueError):
-            continue
-        if 1 <= idx <= n and idx not in seen:
-            seen.add(idx)
-            out.append(candidates[idx - 1])
-            if len(out) >= max_keyframes:
-                break
-    return out
+    positions = valid_keyframe_positions(keyframe_positions, len(candidates), max_keyframes)
+    return [candidates[p - 1] for p in positions]
 
 
-__all__ = ["apply_selection"]
+__all__ = ["apply_selection", "valid_keyframe_positions"]

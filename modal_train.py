@@ -468,13 +468,18 @@ def build_memory_dataset(
     max_keyframes: int = 4,
     joint: bool = True,        # also emit SELECT rows (candidate window → keyframe labels)
                               # for the joint pipeline. False = USE rows only (one-shot SFT).
+    streaming: bool = False,   # MemER-faithful SINGLE-call rows ({current_subtask,
+                              # keyframe_positions} BOTH populated), keyframe buffer carried
+                              # across picks. Supersedes joint SELECT/USE; use with
+                              # --only-tasks ButtonUnmaskSwap. When set, `joint` is ignored.
     seed: int = 0,
     max_episodes: int = 0,
 ) -> dict:
-    """Build the MemER-style memory SFT dataset: USE rows (reveal keyframes + recent
-    + LITERAL ``<y,x>`` grounded pick subgoal) and, when ``joint``, SELECT rows
-    (candidate window → reveal-frame keyframe labels). Warm-start data for GRPO.
-    Writes ``<out_dir>/memory/grounded_subgoal_train.jsonl`` + images.
+    """Build the MemER-style memory SFT dataset. Default: USE rows (reveal keyframes +
+    recent + LITERAL ``<y,x>`` grounded pick subgoal) and, when ``joint``, SELECT rows.
+    With ``streaming``: SINGLE-call MemER rows (one row per pick, BOTH current_subtask
+    and keyframe_positions populated, the keyframe buffer threaded across picks) — the
+    warm-start for streaming GRPO. Writes ``<out_dir>/memory/grounded_subgoal_train.jsonl``.
     """
     from vla_memory.data.build_memory_sft_dataset import build_memory_sft_dataset
 
@@ -489,6 +494,7 @@ def build_memory_dataset(
         n_candidate_frames=n_candidate_frames,
         max_keyframes=max_keyframes,
         also_select=joint,
+        streaming=streaming,
         seed=seed,
         max_episodes=max_episodes or None,
     )
@@ -908,24 +914,40 @@ def validate_memory_checkpoints(
     ``select_n_empty`` (≈ all = the head collapsed to ``[]``, the contradictory-
     supervision bug the SELECT/USE schema separation fixes). Empty for a --no-joint
     dataset (no SELECT rows).
+
+    Aggregate SELECT jaccard is a vanity metric on a mode-dominated val set: a head
+    that emits the single most common target for every input scores high without
+    looking at the image. ``select_n_distinct_preds`` (==1 ⇒ constant collapse) and
+    the OFF-MODE slice — ``select_offmode_jaccard`` vs the blind
+    ``select_offmode_baseline_jaccard`` (predict the mode), with positive lift the
+    only evidence of input-conditioning — are the numbers that actually track
+    selection learning. The off-mode slice is empty when every val target is the
+    same, which itself flags that the val data can't test conditioning.
     """
     import gc
     import json
     import os
     import re
+    from collections import Counter
 
     import numpy as np
     import torch
     from PIL import Image
 
     from vla_memory.qwen_subgoal.model import QwenSubgoalPolicy
-    from vla_memory.qwen_subgoal.prompts import parse_subgoal_output
+    from vla_memory.qwen_subgoal.prompts import SELECT_SYSTEM_PROMPT, parse_subgoal_output
 
     _COORD = re.compile(r"<\s*(-?\d+)\s*,\s*(-?\d+)\s*>")
 
     def coord(s: str):
         m = _COORD.search(s or "")
         return (int(m.group(1)), int(m.group(2))) if m else None
+
+    def set_scores(pred_set: set, tgt_set: set) -> tuple:
+        """(jaccard, recall) for a predicted vs target 1-indexed keyframe set."""
+        inter = len(pred_set & tgt_set)
+        union = len(pred_set | tgt_set)
+        return (inter / union if union else 1.0), (inter / len(tgt_set) if tgt_set else 0.0)
 
     # One row per DISTINCT episode, restricted to coordinate (USE) rows. The old
     # "first n_samples rows" took augmentations of the SAME episode (the reported
@@ -958,11 +980,19 @@ def validate_memory_checkpoints(
             r = json.loads(line)
             sub, pos = parse_subgoal_output(r["messages"][2]["content"])
             ek = episode_key(r)
-            if coord(sub) is not None:           # USE row — coordinate target
+            if coord(sub) is not None:           # USE / streaming row — coordinate target
                 if ek not in seen_use:
                     seen_use.add(ek)
                     use_rows.append(r)
-            elif pos:                            # SELECT row — keyframe_positions, no coord
+            elif pos and r["messages"][0]["content"] == SELECT_SYSTEM_PROMPT:
+                # SELECT row (joint pipeline only): keyframe_positions, no coord, AND the
+                # distinct SELECT system prompt. Gating on the prompt is REQUIRED for
+                # streaming datasets: a streaming row's current_subtask occasionally lacks
+                # a coordinate (≈4/100 ButtonUnmaskSwap eps emit a bare "pick up the
+                # container"), and without the prompt gate those handful of malformed USE
+                # rows would be misread as SELECT rows and fire the dead joint-SELECT
+                # mode-collapse diagnostic. Streaming rows all carry SUBGOAL_SYSTEM_PROMPT
+                # → 0 SELECT, so the SELECT section correctly no-ops for streaming.
                 if ek not in seen_sel:
                     seen_sel.add(ek)
                     sel_rows.append(r)
@@ -981,10 +1011,19 @@ def validate_memory_checkpoints(
     def _load(paths):
         return [np.asarray(Image.open(p).convert("RGB"), dtype=np.uint8) for p in paths]
 
+    # The key/recent split must come from the ROW, not a fixed n_key_frames: streaming
+    # rows carry a variable keyframe buffer (0 at pick 0, N after), so a hard
+    # ``imgs[:4]`` would mis-split them. Count the <image> placeholders in the prompt's
+    # "particular importance" (keyframes) line; falls back to n_key_frames if absent.
+    def n_key_from_prompt(user: str) -> int:
+        mm = re.search(r"particular importance:\s*\[([^\]]*)\]", user)
+        return mm.group(1).count("<image>") if mm else n_key_frames
+
     samples = []
     for r in use_rows:
         imgs = _load(r["images"])
         user = r["messages"][1]["content"]
+        nk = n_key_from_prompt(user)
         m = re.search(r"The task goal is:\s*(.+)", user)
         hm = re.search(r"The subtasks already completed are:\s*(.+)", user)
         history = (
@@ -993,8 +1032,8 @@ def validate_memory_checkpoints(
         )
         target_sub, _ = parse_subgoal_output(r["messages"][2]["content"])
         samples.append({
-            "key": imgs[:n_key_frames],
-            "recent": imgs[n_key_frames:],
+            "key": imgs[:nk],
+            "recent": imgs[nk:],
             "task_goal": m.group(1).strip() if m else "",
             "history": history,
             "target": target_sub,
@@ -1021,6 +1060,31 @@ def validate_memory_checkpoints(
         flush=True,
     )
 
+    # Off-mode SELECT slice. A mode-collapsed head emits the single most common
+    # target for EVERY input and still scores high jaccard whenever the val set is
+    # mode-dominated (the [1,5,8,12] case — index 1=reveal and 12=pick are near-
+    # structural, so only the middle pair carries input). The off-mode slice
+    # (targets ≠ the modal set) plus a "blind" baseline (what predicting the mode
+    # would score on those same samples) isolates input-conditioning: model jaccard
+    # ABOVE baseline ⇒ the head moves with the image; ≈ baseline ⇒ it's the constant.
+    sel_mode_tuple = (
+        Counter(tuple(s["target_pos"]) for s in sel_samples).most_common(1)[0][0]
+        if sel_samples else ()
+    )
+    sel_mode_set = set(sel_mode_tuple)
+    off_mode_idx = [
+        j for j, s in enumerate(sel_samples)
+        if tuple(s["target_pos"]) != sel_mode_tuple
+    ]
+    if sel_samples:
+        n_on = len(sel_samples) - len(off_mode_idx)
+        print(
+            f"[mem-validate] SELECT modal target={list(sel_mode_tuple)} "
+            f"({n_on}/{len(sel_samples)} on-mode, {len(off_mode_idx)} off-mode); "
+            "off-mode jaccard tracks input-conditioning, not mode-matching",
+            flush=True,
+        )
+
     base = Path(run_dir)
     versioned = sorted(base.glob("v*-*"))
     run = versioned[-1] if versioned else base
@@ -1035,6 +1099,7 @@ def validate_memory_checkpoints(
         dists = []
         sel_jacc: list = []
         sel_rec: list = []
+        sel_preds: list = []
         sel_empty = 0
         try:
             policy = QwenSubgoalPolicy(adapter_init_path=str(ckpt), device="cuda")
@@ -1066,10 +1131,10 @@ def validate_memory_checkpoints(
                 ncand = len(s["candidates"])
                 pred_set = {p for p in pred if 1 <= p <= ncand}   # clamp to valid indices
                 tgt_set = set(s["target_pos"])
-                inter = len(pred_set & tgt_set)
-                union = len(pred_set | tgt_set)
-                sel_jacc.append(inter / union if union else 1.0)
-                sel_rec.append(inter / len(tgt_set) if tgt_set else 0.0)
+                jacc, rec = set_scores(pred_set, tgt_set)
+                sel_jacc.append(jacc)
+                sel_rec.append(rec)
+                sel_preds.append(tuple(sorted(pred_set)))
                 sel_empty += 1 if not pred_set else 0
                 print(f"  sel{j}: PRED={sorted(pred_set)} TGT={sorted(tgt_set)}", flush=True)
         except Exception as exc:
@@ -1093,18 +1158,50 @@ def validate_memory_checkpoints(
         if sel_samples:
             mean_jacc = float(np.mean(sel_jacc))
             mean_rec = float(np.mean(sel_rec))
+            n_distinct = len(set(sel_preds))
+            # Off-mode slice: model score vs the blind "always predict the mode"
+            # baseline on the SAME off-mode samples. lift = model − baseline isolates
+            # whether the head conditions on the image; n_distinct==1 ⇒ constant collapse.
+            off_j = float(np.mean([sel_jacc[j] for j in off_mode_idx])) if off_mode_idx else None
+            off_r = float(np.mean([sel_rec[j] for j in off_mode_idx])) if off_mode_idx else None
+            off_base = [set_scores(sel_mode_set, set(sel_samples[j]["target_pos"]))
+                        for j in off_mode_idx]
+            base_j = float(np.mean([b[0] for b in off_base])) if off_base else None
+            base_r = float(np.mean([b[1] for b in off_base])) if off_base else None
             result.update({
                 "select_mean_jaccard": mean_jacc,
                 "select_mean_recall": mean_rec,
                 "select_n_empty": sel_empty,
+                "select_n_distinct_preds": n_distinct,
                 "n_select_samples": len(sel_samples),
+                "select_offmode_jaccard": off_j,
+                "select_offmode_recall": off_r,
+                "select_offmode_baseline_jaccard": base_j,
+                "select_offmode_baseline_recall": base_r,
+                "n_select_offmode": len(off_mode_idx),
             })
             print(
                 f"[mem-validate] {ckpt.name}: SELECT jaccard={mean_jacc:.3f} "
                 f"recall={mean_rec:.3f} empty={sel_empty}/{len(sel_samples)} "
-                "(empty≈all → SELECT head collapsed to []; the schema fix should prevent it)",
+                f"distinct_preds={n_distinct}/{len(sel_samples)} "
+                f"({'CONSTANT → input-blind collapse' if n_distinct <= 1 else 'varies'})",
                 flush=True,
             )
+            if off_mode_idx:
+                lift = off_j - base_j
+                verdict = "conditions on input" if lift > 0.05 else "NO lift → head ignores the image"
+                print(
+                    f"[mem-validate] {ckpt.name}: SELECT off-mode (n={len(off_mode_idx)}) "
+                    f"jaccard={off_j:.3f} recall={off_r:.3f} vs blind-mode baseline "
+                    f"jaccard={base_j:.3f} recall={base_r:.3f} → lift={lift:+.3f} ({verdict})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[mem-validate] {ckpt.name}: SELECT off-mode slice empty (all val "
+                    "targets identical) — add Swap/off-mode episodes to test conditioning",
+                    flush=True,
+                )
         results.append(result)
     return {"run": str(run), "results": results}
 
@@ -1293,6 +1390,98 @@ def probe_vlm_rollout(
             "probe_exit_code": rc, "proceed": rc == 0}
 
 
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=4 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def probe_snapshot_parity(
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    tasks: str = "ButtonUnmask:0,ButtonUnmaskSwap:0,ButtonUnmaskSwap:1",
+    n_episodes: int = 6,
+    seed: int = 20260601,
+    rollout_max_steps: int = 700,   # must exceed warm-up to the LATEST pick + forward pass,
+                                    # else Swap pick_index=1 decision points truncate (all skipped)
+    decision_warm_cap: int = 250,
+) -> dict:
+    """GATE for ``--snapshot-branching``: does ``peek_and_snapshot`` → ``restore_env``
+    reproduce the env bit-for-bit?
+
+    Record-then-replay parity check (oracle-driven, no SFT adapter): warm to a
+    decision point, snapshot, then RESTORE + REPLAY recorded actions and assert the
+    reward + per-step task-index trajectory + final physics are identical. Exit 0 →
+    safe to enable ``--snapshot-branching``; nonzero → the snapshot misses some
+    reward-relevant state, keep the rebuild path. See ``snapshot_parity_probe.py``.
+    """
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting GroundSG π0.5 server on localhost:{port} …")
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}",
+            f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app",
+        env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("GroundSG policy server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("GroundSG server is up.")
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("GroundSG policy server did not become reachable")
+
+    probe_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        # CPU rendering for the simulator (same as the GRPO/eval container).
+        "SAPIEN_RENDER_DEVICE": "cpu",
+        "MUJOCO_GL": "osmesa",
+    }
+    cmd = [
+        "micromamba", "run", "-n", "robomme",
+        "python", "-u", "/workspace/src/vla_memory/grpo/snapshot_parity_probe.py",
+        f"--port={port}",
+        f"--tasks={tasks}",
+        f"--n-episodes={n_episodes}",
+        f"--seed={seed}",
+        f"--rollout-max-steps={rollout_max_steps}",
+        f"--decision-warm-cap={decision_warm_cap}",
+    ]
+    import shlex
+    print("Launching snapshot parity probe:", shlex.join(cmd), flush=True)
+    rc = 1
+    try:
+        proc = subprocess.run(cmd, env=probe_env, cwd="/workspace")
+        rc = proc.returncode
+    finally:
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+    return {"tasks": tasks, "n_episodes": n_episodes,
+            "probe_exit_code": rc, "proceed": rc == 0}
+
+
 # ---------------------------------------------------------------------------
 # Stage B — GRPO
 # ---------------------------------------------------------------------------
@@ -1319,19 +1508,34 @@ def grpo(
     policy_config: str = "mme_vla_suite",
     output_dir: str = f"{MOUNT}/runs/grpo/buttonunmask_groundsg_v0",
     num_steps: int = 200,
+    save_every: int = 25,             # checkpoint cadence. The CPU-sim bottleneck caps a
+                                      # 24h streaming run at ~15 steps, so the default 25
+                                      # banks nothing before timeout — set ~3 for long runs.
     batch_states: int = 4,
     group_size: int = 8,
     kl_beta: float = 0.0,             # KL off (DAPO/TRL default); reference only used if >0
     learning_rate: float = 1e-4,      # ~10x v0; LoRA RL wants a higher lr than SFT
     sample_temperature: float = 1.0,
     rollouts_per_subgoal: int = 1,    # >1 averages reward to cut pi0.5 flow-sampling noise
-    rollout_max_steps: int = 200,
+    rollout_max_steps: int = 700,     # bounds warm-up + forward exec. Must clear the LATEST
+                                      # pick's warm-up (Swap pick 2 ~rel 410, cap decision_warm_cap×2
+                                      # =500) + the pick itself, else pick_index=1 states truncate
+                                      # before their decision point. ButtonUnmask finishes well under.
     only_tasks: str = "ButtonUnmask",   # Permanence/spatial-memory task (was PickXtimes)
     episodes_per_task: int = 20,
+    picks_per_episode: int = 1,         # >1 (e.g. 2 for ButtonUnmaskSwap): one GRPO state per
+                                        # pick so each pick earns reward (oracle drives earlier picks)
+
     subgoal_type: str = "grounded_subgoal",   # memory lives in the grounding (which container)
     joint_selection: bool = False,    # joint select-then-use: train keyframe selection + subtask
-    n_candidate_frames: int = 12,     # SELECT-call candidate window (joint)
-    max_keyframes: int = 4,           # cap on kept keyframes (joint)
+    streaming_memory: bool = False,   # MemER-faithful single-call output: VLM owns the whole episode,
+                                      # keyframe buffer accumulates across picks → GRPO trains selection.
+                                      # Use with only_tasks=ButtonUnmaskSwap. Excludes joint_selection.
+    streaming_max_picks: int = 4,     # cap on decision points (picks) per streaming episode
+    n_candidate_frames: int = 12,     # SELECT-call candidate window (joint) / broad window (streaming)
+    max_keyframes: int = 4,           # cap on kept keyframes (joint) / nominated per call (streaming)
+    snapshot_branching: bool = False, # speed: warm once/group, snapshot+restore per candidate
+                                      # (no K re-warms). Gate with ::probe_snapshot_parity first.
     seed: int = 0,
     debug_subgoals: bool = False,     # print each sampled subgoal's text + token count
 ) -> dict:
@@ -1412,9 +1616,9 @@ def grpo(
         "micromamba", "run", "-n", "robomme",
         "python", "-u", "/workspace/src/vla_memory/grpo/main.py",
         f"--port={port}",
-        f"--sft-adapter-path={sft_adapter_path}",
         f"--output-dir={output_dir}",
         f"--num-steps={num_steps}",
+        f"--save-every={save_every}",
         f"--batch-states={batch_states}",
         f"--group-size={group_size}",
         f"--kl-beta={kl_beta}",
@@ -1424,12 +1628,20 @@ def grpo(
         f"--rollout-max-steps={rollout_max_steps}",
         f"--only-tasks={only_tasks}",
         f"--episodes-per-task={episodes_per_task}",
+        f"--picks-per-episode={picks_per_episode}",
         f"--subgoal-type={subgoal_type}",
         f"--n-candidate-frames={n_candidate_frames}",
         f"--max-keyframes={max_keyframes}",
         f"--seed={seed}",
     ]
+    # Empty sft_adapter_path => cold-start baseline (no SFT warmup): omit the flag
+    # so main.py builds a fresh LoRA on base Qwen.
+    if sft_adapter_path:
+        grpo_cmd.append(f"--sft-adapter-path={sft_adapter_path}")
     grpo_cmd.append("--joint-selection" if joint_selection else "--no-joint-selection")
+    grpo_cmd.append("--streaming-memory" if streaming_memory else "--no-streaming-memory")
+    grpo_cmd.append(f"--streaming-max-picks={streaming_max_picks}")
+    grpo_cmd.append("--snapshot-branching" if snapshot_branching else "--no-snapshot-branching")
     if debug_subgoals:
         grpo_cmd.append("--debug-subgoals")
     import shlex
@@ -1468,6 +1680,7 @@ def main(stage: str = "grpo"):
         modal run modal_train.py --stage build_memory     # H5 -> memory SFT JSONL (Permanence: ButtonUnmask+VideoUnmask grounded)
         modal run modal_train.py --stage sft              # SFT warmstart (memory data)
         modal run modal_train.py --stage probe_vlm        # held-out VLM rollout gate (pre-GRPO)
+        modal run modal_train.py --stage probe_snapshot   # snapshot/restore parity gate (pre --snapshot-branching)
         modal run modal_train.py --stage grpo             # GRPO fine-tune
     """
     if stage == "download_data":
@@ -1486,6 +1699,8 @@ def main(stage: str = "grpo"):
         print(sft_warmstart.remote())
     elif stage == "probe_vlm":
         print(probe_vlm_rollout.remote())
+    elif stage == "probe_snapshot":
+        print(probe_snapshot_parity.remote())
     elif stage == "grpo":
         print(grpo.remote())
     else:

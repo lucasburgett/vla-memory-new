@@ -29,6 +29,64 @@ Design docs: **`MEMORY_PIPELINE.md`** (Phase 0–5 plan), **`JOINT_MEMORY_DESIGN
 (the joint select-then-use architecture). Memories in `/memory/` carry the
 hard-won lessons — read `project_memory_pipeline_direction.md` first.
 
+## MemER single-call STREAMING (current direction — branch `grpo-memer-streaming`)
+
+**Goal:** make the VLM emit the SAME output as MemER's VLM — ONE JSON
+`{current_subtask, keyframe_positions}` per call — and train it with **GRPO** instead
+of imitation. This SUPERSEDES the two-call SELECT/USE split (`joint_selection`), which
+was itself a divergence from MemER (two prompts, two generations) adopted only because
+keyframe selection is causal only ACROSS timesteps and we queried the VLM once per pick.
+
+**Mechanism — decision-point streaming (`--streaming-memory`, task `ButtonUnmaskSwap`):**
+the VLM owns the whole episode. At each pick it makes ONE MemER call over
+`[keyframe_buffer + broad recent window]`; the nominated `keyframe_positions` accumulate
+into a persistent buffer (MemER clustering, `KeyframeBuffer`, d=8/cap=8). What it keeps at
+pick 0 (whose window spans reveal+swaps) is the ONLY memory of pick 1's now-occluded
+target → selection causally moves the episode reward → **GRPO trains selection**. The
+oracle drives only the deterministic scaffolding (presses, put-downs); the VLM owns each
+grounded pick. Trajectory = the per-pick calls, all sharing the one episode advantage
+(the existing trajectory loss in `_accumulate_gradients` handles this unchanged).
+
+**New/changed code (all additive + gated; one-shot/joint paths and their parity tests
+stay green):**
+- `grpo/keyframe_buffer.py` (NEW) — `KeyframeBuffer`/`TaggedFrame`, MemER d=8/cap=8 merge.
+- `grpo/rollout.py` — `rollout_streaming` GENERATOR (yields `DecisionPoint`, `.send()`s
+  `(subtask, keyframe_positions)`, yields `RolloutResult`); abs-step frame tagging;
+  `from_qwen_xy` applied at the single executor point, NOT to oracle scaffolding.
+- `grpo/trainer.py` — `GRPOConfig.streaming_memory`/`streaming_max_picks`; `_streaming_group`
+  (K full episodes/group under CRN seed, k=1 per call); dispatch in `_rollout_group`;
+  asserts `snapshot_branching` off (streaming branches the whole episode, not one point).
+- `grpo/selection.py` — `valid_keyframe_positions` (shared by `apply_selection` + the
+  buffer step-tagging).
+- `grpo/state_dataset.py` — `streaming` flag → ONE state per episode.
+- `data/build_memory_sft_dataset.py` — `streaming` mode: SINGLE-call rows (BOTH fields
+  populated), keyframe buffer threaded across picks.
+- `modal_train.py` — `build_memory_dataset(streaming=…)`, `grpo(streaming_memory=…,
+  streaming_max_picks=…)`; `validate_memory_checkpoints` now reads the key/recent split
+  from each row's prompt (so the variable streaming buffer validates correctly).
+- Tests: `test_keyframe_buffer.py`, `test_streaming_rollout.py` (generator protocol +
+  buffer accumulation + the conversion point); all prior tests still pass.
+
+**RUN IT (this is the GRPO run the branch was built for):**
+```bash
+# 1. SINGLE-call MemER streaming SFT data on the Swap task (both fields per row)
+modal run modal_train.py::build_memory_dataset --only-tasks ButtonUnmaskSwap --streaming
+# 2. warm-start SFT (lr 2e-5, label_smoothing 0.0; same stage as before)
+modal run modal_train.py::sft_warmstart
+# 3. gate: coord px-dist small + varying (validator auto-splits key/recent per row)
+modal run modal_train.py::validate_memory_checkpoints
+# 4. STREAMING GRPO (single-call MemER output, selection trained by reward) — SMOKE FIRST
+modal run modal_train.py::grpo --streaming-memory --only-tasks ButtonUnmaskSwap \
+  --num-steps 8 --debug-subgoals \
+  --sft-adapter-path <…>/permanence_grounded/<v*>/checkpoint-<best>
+```
+Smoke goal (step 0–8): `--debug-subgoals` shows each pick's `kf=` VARIES, the buffer grows
+(`buf=` on pick 1), generations terminate, and Swap groups are NON-degenerate (reward
+varies with selection — unlike vanilla ButtonUnmask's 11/12-dropped). Then scale
+`--num-steps`. **Cost note:** streaming runs K FULL episodes/group (no snapshot shortcut —
+each candidate's pick-0 choice changes the whole episode), so it is the dominant
+wall-clock; keep `--episodes-per-task`/`--group-size` modest for the smoke run.
+
 ## Where we are (2026-06-01)
 
 **Foundation VALIDATED.** The original `pi05_baseline` *discards the subgoal*
@@ -246,31 +304,48 @@ is named in the Deferred section.
      on Swap this trains the USE head on the swap-tracking frames it will actually get
      (else it'd be trained reveal-only → couldn't ground the post-swap position → the run
      would go degenerate-toward-FAILURE). One-shot path keeps reveal-window (ckpt-150 parity).
-   - **Runnable now (single-pick first-pick path):**
+   - **DONE: multi-pick per-pick reward (2026-06-01).** Each pick is its OWN GRPO state:
+     the oracle drives picks 0..i-1 (executing them), the VLM owns pick i, scored by
+     absolute progress. Both picks earn reward; GRPO's within-group advantage is relative
+     so the later picks' progress floor (the oracle's earlier picks) cancels — each pick's
+     selection gets a clean gradient. Chose per-pick STATES over a resumable
+     multi-decision rollout: simpler, reuses the existing single-decision machinery, and
+     CLEANER credit (each selection scored by its own pick, not entangled in one
+     accumulated reward). Implemented across: `state_dataset` (`pick_index` +
+     `picks_per_episode`), `rollout._warmup(pick_index)` (warm to the i-th pick, cap ×(i+1),
+     history = completed subtasks incl. earlier picks), `peek`/`rollout` plumbing, `trainer`
+     (passes `state.pick_index`), `main.py`/`modal grpo` (`--picks-per-episode`,
+     `decision-warm-cap` 150→250), builder (`_emit_pick` loops over ALL picks; history +
+     keyframes + grounded per pick). Builder↔rollout history parity unit-verified.
+   - **Run it:**
      ```bash
-     modal run modal_train.py::build_memory_dataset --only-tasks ButtonUnmaskSwap   # joint USE+SELECT
+     modal run modal_train.py::build_memory_dataset --only-tasks ButtonUnmaskSwap   # per-pick USE+SELECT rows
      modal run modal_train.py::sft_warmstart
      modal run modal_train.py::validate_memory_checkpoints   # both heads; pick high SELECT jaccard
-     modal run modal_train.py::grpo --joint-selection --only-tasks ButtonUnmaskSwap --debug-subgoals \
-       --num-steps 40 --sft-adapter-path <…>/permanence_grounded/<v*>/checkpoint-<best>
+     modal run modal_train.py::grpo --joint-selection --only-tasks ButtonUnmaskSwap \
+       --picks-per-episode 2 --debug-subgoals --num-steps 40 \
+       --sft-adapter-path <…>/permanence_grounded/<v*>/checkpoint-<best>
      ```
-     **Core question this answers:** are Swap groups NON-degenerate (reward varies with
-     selection), unlike ButtonUnmask's 11/12-dropped? On 2-pick episodes reward caps at
-     ~0.5 (first pick) — fine for the degeneracy check.
-   - **TODO — multi-pick per-pick reward** (the better design, supersedes first-pick-only):
-     query the VLM at EACH pick so completing both → full reward (0.5 + 0.5). Needs a
-     multi-decision rollout: warm-up(oracle)→SELECT→USE→execute pick1→oracle through the
-     put-down→SELECT→USE→execute pick2; trajectory = all generations, reward = accumulated
-     progress. Build AFTER the single-pick run confirms selection is learnable on Swap.
+     **Core question:** are Swap groups NON-degenerate (reward varies with selection),
+     unlike ButtonUnmask's 11/12-dropped? Note: pick-2 states only reach their decision
+     when the oracle completes pick-1 (~83%), so expect some pick-2 groups dropped — that's
+     warm-up yield, not a selection failure.
 
 6. **Eval vs baselines** (Phase 5) — ours (GRPO-VLM + GroundSG) vs MemER-IL vs
    memoryless `pi05_baseline` on the **Swap** Permanence val/test (the task where the
    selection claim is meaningful).
 
 ### Deferred (don't block the above)
-- **GRPO speed**: `_ensure_env` rebuilds the env per rollout (`make_env`) — correct
-  but slow. Optimize with `env.get_state/set_state` snapshot once per group. See the
-  `_ensure_env` TODO + `MEMORY_PIPELINE.md`.
+- **GRPO speed — IMPLEMENTED (opt-in, gated; 2026-06-01).** `_ensure_env` rebuilt the
+  env per rollout (K+1 warm-ups/group). New `--snapshot-branching` (default OFF) warms
+  up ONCE, snapshots the env at the decision point (`grpo/env_snapshot.py`: physics
+  `get_state_dict` + the WHOLE wrapper-chain bookkeeping incl. `_elapsed_steps` + the
+  `DemonstrationWrapper` layer — a bare `get_state_dict` is insufficient), and restores
+  it per candidate (`rollout.peek_and_snapshot`/`rollout_from_snapshot`). Also removes
+  warm-up sampling noise between candidates. **GATE before trusting it:**
+  `modal run modal_train.py::probe_snapshot_parity` (record-then-replay parity; must
+  exit 0 on ButtonUnmask + ButtonUnmaskSwap pick 0/1) — keeps the rebuild path as the
+  verified default. Copy-policy unit test: `tests/test_env_snapshot.py`.
 - **Learned keyframe selection refinement** beyond the heuristic SELECT labels.
 
 ### Named fallback (if joint-RL selection is too weak)

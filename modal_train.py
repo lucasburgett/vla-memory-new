@@ -1393,6 +1393,132 @@ def probe_vlm_rollout(
 @app.function(
     image=image,
     gpu="A100-80GB",
+    timeout=8 * 3600,            # 50 VLM + 50 oracle FULL episodes on CPU-rendered sim
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def eval_streaming(
+    # The finished MemER-streaming GRPO checkpoint. A GRPO step dir (.../stepN holds
+    # policy/), a swift output_dir, or any adapter dir all resolve (eval_streaming.py).
+    adapter_path: str = f"{MOUNT}/runs/grpo/buttonunmask_swap_streaming_12h/step15",
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    task: str = "ButtonUnmaskSwap",
+    episodes: int = 50,
+    seed: int = 20260601,             # held-out base, distinct from the GRPO training seed=0
+    run_oracle: bool = True,          # also roll the online-oracle ceiling per seed
+    # Streaming hyperparameters — MUST match the training run's wandb config.
+    rollout_max_steps: int = 700,
+    streaming_max_picks: int = 4,
+    n_candidate_frames: int = 12,
+    max_keyframes: int = 4,
+    decision_warm_cap: int = 250,
+    record_video: bool = False,       # save annotated per-episode mp4s to output_dir/videos
+                                      # (VLM + oracle). Use a SMALL --episodes for this.
+    output_dir: str = f"{MOUNT}/eval_results/streaming_grpo_step15",
+) -> dict:
+    """Full FAITHFUL eval of a ``--streaming-memory`` GRPO checkpoint on RoboMME.
+
+    Drives the SAME inference path the model was trained on
+    (``RolloutWorker.rollout_streaming`` — single-call MemER output, accumulating
+    keyframe buffer), greedy-decoding each pick, on HELD-OUT seeds, and compares to
+    the online-oracle ceiling. The one-shot ``probe_vlm_rollout`` would mis-measure a
+    streaming adapter (it ignores ``keyframe_positions`` and makes one decision), so
+    this exists separately. Writes ``eval_summary.json`` to ``output_dir`` on the
+    volume. See ``grpo/eval_streaming.py``.
+    """
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting GroundSG π0.5 server on localhost:{port} …")
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}",
+            f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app",
+        env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("GroundSG policy server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("GroundSG server is up.")
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("GroundSG policy server did not become reachable")
+
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    Path(hf_cache_dir).mkdir(parents=True, exist_ok=True)
+    eval_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "SAPIEN_RENDER_DEVICE": "cpu",
+        "MUJOCO_GL": "osmesa",
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+    }
+    cmd = [
+        "micromamba", "run", "-n", "robomme",
+        "python", "-u", "/workspace/src/vla_memory/grpo/eval_streaming.py",
+        f"--port={port}",
+        f"--adapter-path={adapter_path}",
+        f"--task={task}",
+        f"--episodes={episodes}",
+        f"--seed={seed}",
+        f"--rollout-max-steps={rollout_max_steps}",
+        f"--streaming-max-picks={streaming_max_picks}",
+        f"--n-candidate-frames={n_candidate_frames}",
+        f"--max-keyframes={max_keyframes}",
+        f"--decision-warm-cap={decision_warm_cap}",
+        f"--output-dir={output_dir}",
+    ]
+    cmd.append("--run-oracle" if run_oracle else "--no-run-oracle")
+    cmd.append("--record-video" if record_video else "--no-record-video")
+    import shlex
+    print("Launching streaming hierarchy eval:", shlex.join(cmd), flush=True)
+    rc = 1
+    try:
+        proc = subprocess.run(cmd, env=eval_env, cwd="/workspace")
+        rc = proc.returncode
+    finally:
+        # Persist results even if the eval errored partway.
+        try:
+            volume.commit()
+        except Exception as commit_exc:
+            print(f"[eval] volume.commit() failed: {commit_exc!r}", flush=True)
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+    summary_path = Path(output_dir) / "eval_summary.json"
+    summary = {}
+    if summary_path.exists():
+        import json as _json
+        summary = _json.loads(summary_path.read_text())
+    return {"task": task, "episodes": episodes, "adapter": adapter_path,
+            "eval_exit_code": rc, "output_dir": output_dir, "summary": summary}
+
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
     timeout=4 * 3600,
     volumes={MOUNT: volume},
     secrets=[modal.Secret.from_dotenv(__file__)],
@@ -1517,6 +1643,10 @@ def grpo(
     learning_rate: float = 1e-4,      # ~10x v0; LoRA RL wants a higher lr than SFT
     sample_temperature: float = 1.0,
     rollouts_per_subgoal: int = 1,    # >1 averages reward to cut pi0.5 flow-sampling noise
+    dynamic_sampling: bool = True,    # resample states until batch_states non-degenerate groups
+    dynamic_sampling_max_multiplier: int = 3,  # cap group attempts at batch_states*this per step.
+                                      # LOWER (e.g. 2) bounds the wall-time blowup when reward is
+                                      # near-saturated and most groups come out degenerate.
     rollout_max_steps: int = 700,     # bounds warm-up + forward exec. Must clear the LATEST
                                       # pick's warm-up (Swap pick 2 ~rel 410, cap decision_warm_cap×2
                                       # =500) + the pick itself, else pick_index=1 states truncate
@@ -1625,6 +1755,7 @@ def grpo(
         f"--learning-rate={learning_rate}",
         f"--sample-temperature={sample_temperature}",
         f"--rollouts-per-subgoal={rollouts_per_subgoal}",
+        f"--dynamic-sampling-max-multiplier={dynamic_sampling_max_multiplier}",
         f"--rollout-max-steps={rollout_max_steps}",
         f"--only-tasks={only_tasks}",
         f"--episodes-per-task={episodes_per_task}",
@@ -1638,6 +1769,7 @@ def grpo(
     # so main.py builds a fresh LoRA on base Qwen.
     if sft_adapter_path:
         grpo_cmd.append(f"--sft-adapter-path={sft_adapter_path}")
+    grpo_cmd.append("--dynamic-sampling" if dynamic_sampling else "--no-dynamic-sampling")
     grpo_cmd.append("--joint-selection" if joint_selection else "--no-joint-selection")
     grpo_cmd.append("--streaming-memory" if streaming_memory else "--no-streaming-memory")
     grpo_cmd.append(f"--streaming-max-picks={streaming_max_picks}")

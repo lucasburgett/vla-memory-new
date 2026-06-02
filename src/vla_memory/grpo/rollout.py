@@ -583,13 +583,18 @@ class RolloutWorker:
         return "pick up the container" in phase
 
     def _stream_apply(
-        self, actions, image_buf, wrist_buf, state_buf, captured, captured_steps, n_steps
+        self, actions, image_buf, wrist_buf, state_buf, captured, captured_steps, n_steps,
+        recorder=None, subgoal=None,
     ):
         """Apply ONE inferred action chunk, updating the rolling buffers and the
         unbounded (frame, abs_step) capture. Returns
         ``(img, wrist, robot_state, n_steps, stop, success_flag, dead)`` — ``dead``
         is True iff the sim returned a None frame (error). Shared by the oracle-scaffold
         and VLM-pick loops of ``rollout_streaming`` so the stepping/capture is in one place.
+
+        ``recorder`` (eval-only, default None) is the submodule's ``RolloutRecorder``;
+        when provided, each stepped frame is annotated with ``subgoal`` and appended to
+        the video. None in training → this is a no-op and the path is byte-identical.
         """
         img = wrist = robot_state = None
         stop = False
@@ -604,6 +609,8 @@ class RolloutWorker:
             state_buf.append(robot_state)
             captured.append(img)
             captured_steps.append(n_steps)
+            if recorder is not None:
+                recorder.record(img, wrist, robot_state, subgoal=subgoal)
             if stop or n_steps >= self.max_steps:
                 break
         return img, wrist, robot_state, n_steps, stop, success_flag, False
@@ -637,6 +644,7 @@ class RolloutWorker:
         seed: Optional[int] = None,
         max_picks: int = 4,
         per_pick_max_steps: Optional[int] = None,
+        recorder=None,
     ) -> Iterator[object]:
         """GENERATOR: the VLM owns the whole episode, accumulating a keyframe buffer
         across pick decision points — MemER's mechanism, single-call output, trained
@@ -672,6 +680,8 @@ class RolloutWorker:
         state_buf = deque(init["states"], maxlen=64)
         exec_start_idx = len(image_buf) - 1
         task_goal = init["task_goal"]
+        if recorder is not None:
+            recorder.task_goal = task_goal   # overlay the real per-episode instruction
         img, wrist, robot_state = image_buf[-1], wrist_buf[-1], state_buf[-1]
 
         n_steps = 0
@@ -703,7 +713,8 @@ class RolloutWorker:
                     image_buf=image_buf, state_buf=state_buf, exec_start_idx=exec_start_idx,
                 )
                 img, wrist, robot_state, n_steps, stop, success_flag, dead = self._stream_apply(
-                    actions, image_buf, wrist_buf, state_buf, captured, captured_steps, n_steps
+                    actions, image_buf, wrist_buf, state_buf, captured, captured_steps, n_steps,
+                    recorder=recorder, subgoal=subgoal,
                 )
                 if dead:
                     yield self._finalize("error", image_buf[-1], n_steps)
@@ -758,7 +769,8 @@ class RolloutWorker:
                     image_buf=image_buf, state_buf=state_buf, exec_start_idx=exec_start_idx,
                 )
                 img, wrist, robot_state, n_steps, stop, success_flag, dead = self._stream_apply(
-                    actions, image_buf, wrist_buf, state_buf, captured, captured_steps, n_steps
+                    actions, image_buf, wrist_buf, state_buf, captured, captured_steps, n_steps,
+                    recorder=recorder, subgoal=subtask,
                 )
                 if dead:
                     yield self._finalize("error", image_buf[-1], n_steps)
@@ -777,7 +789,7 @@ class RolloutWorker:
         yield self._finalize(success_flag, img, n_steps)
 
     def rollout_oracle(
-        self, episode_id: int, seed: Optional[int] = None, log_every: int = 0
+        self, episode_id: int, seed: Optional[int] = None, log_every: int = 0, recorder=None
     ) -> RolloutResult:
         """GroundSG + ONLINE-ORACLE upper bound — drive the WHOLE episode with the
         per-chunk oracle subgoal (re-queried each inference, as MemER's high-level
@@ -820,6 +832,8 @@ class RolloutWorker:
                 image_buf.append(img)
                 wrist_buf.append(wrist)
                 state_buf.append(robot_state)
+                if recorder is not None:
+                    recorder.record(img, wrist, robot_state, subgoal=subgoal)
                 if stop or n_steps >= self.max_steps:
                     break
             if stop or n_steps >= self.max_steps:

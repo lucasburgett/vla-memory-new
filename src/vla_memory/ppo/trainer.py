@@ -46,6 +46,7 @@ class PPOConfig:
     batch_states: int = 4           # states per gradient step
     rollouts_per_state: int = 8     # K rollouts per state (replaces group_size)
     coeff_vf: float = 0.5           # value loss weight
+    kl_beta: float = 0.0            # KL penalty vs SFT reference (0 = off)
     learning_rate: float = 1e-4
     grad_clip: float = 1.0
     sample_temperature: float = 1.0
@@ -267,10 +268,25 @@ class PPOTrainer:
                 # Policy gradient per candidate (advantage uses detached V)
                 v_detached = float(v.detach().item())
                 cand_scale = 1.0 / max(float(len(cands)), 1.0) * state_scale
+                use_kl = self.policy.has_reference and self.cfg.kl_beta > 0.0
                 for c, r in zip(cands, rewards):
                     if c.token_ids.numel() == 0:
                         continue
                     adv = r - v_detached
+                    # KL: reference forward first (no grad) so policy adapter is
+                    # active at backward() — same ordering as GRPO._score_generation.
+                    ref_logp = None
+                    if use_kl:
+                        with torch.no_grad():
+                            ref_logp = self.policy.policy_logprobs(
+                                prompt_input_ids=c.prompt_input_ids,
+                                prompt_attention_mask=c.prompt_attention_mask,
+                                gen_token_ids=c.token_ids,
+                                pixel_values=c.pixel_values,
+                                image_grid_thw=c.image_grid_thw,
+                                adapter="reference",
+                                gradient_enabled=False,
+                            )
                     policy_logp = self.policy.policy_logprobs(
                         prompt_input_ids=c.prompt_input_ids,
                         prompt_attention_mask=c.prompt_attention_mask,
@@ -281,7 +297,11 @@ class PPOTrainer:
                         gradient_enabled=True,
                     )
                     pg_term = -adv * policy_logp.sum() / token_norm * cand_scale
-                    pg_term.backward()
+                    loss = pg_term
+                    if use_kl:
+                        kl_term = (policy_logp - ref_logp).pow(2).sum() / token_norm * cand_scale
+                        loss = loss + self.cfg.kl_beta * kl_term
+                    loss.backward()
                     pg_sum += float(pg_term.detach().item())
                     n_tokens += int(policy_logp.shape[0])
 

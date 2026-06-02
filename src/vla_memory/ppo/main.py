@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--batch-states", type=int, default=4)
     parser.add_argument("--rollouts-per-state", type=int, default=8)
     parser.add_argument("--coeff-vf", type=float, default=0.5)
+    parser.add_argument("--kl-beta", type=float, default=0.0)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--sample-temperature", type=float, default=1.0)
     parser.add_argument("--rollouts-per-subgoal", type=int, default=1)
@@ -115,6 +116,7 @@ def main() -> None:
         batch_states=args.batch_states,
         rollouts_per_state=args.rollouts_per_state,
         coeff_vf=args.coeff_vf,
+        kl_beta=args.kl_beta,
         learning_rate=args.learning_rate,
         sample_temperature=args.sample_temperature,
         rollouts_per_subgoal=args.rollouts_per_subgoal,

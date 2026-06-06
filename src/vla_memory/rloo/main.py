@@ -111,7 +111,7 @@ def main() -> None:
     dataset = StateDataset.from_task_list(
         task_names=task_list,
         episodes_per_task=args.episodes_per_task,
-        tasks_with_video_demo=list(TASK_WITH_VIDEO_DEMO),
+        tasks_with_video_demo=[],  # image-only prompts; video_grid_thw=None crashes Qwen3VL
     )
 
     cfg = RLOOConfig(

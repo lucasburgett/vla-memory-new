@@ -155,7 +155,8 @@ class MemorySFTBuilder:
         if decision_ts is None:
             return 0
 
-        grounded = (
+        from vla_memory.qwen_subgoal.coords import to_qwen_xy
+        grounded = to_qwen_xy(
             episode_data[f"timestep_{decision_ts}"]["info"]["grounded_subgoal_online"][()]
             .decode()
             .strip()

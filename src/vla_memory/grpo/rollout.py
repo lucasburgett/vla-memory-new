@@ -331,6 +331,8 @@ class RolloutWorker:
     ) -> RolloutResult:
         """Warm up to the decision point (oracle-driven), then execute
         ``sampled_subgoal`` to the episode end and score the outcome."""
+        from vla_memory.qwen_subgoal.coords import from_qwen_xy
+        sampled_subgoal = from_qwen_xy(sampled_subgoal)
         captured, task_goal, n_steps, terminated, success_flag, carry, _phase0 = self._warmup(
             episode_id, seed
         )

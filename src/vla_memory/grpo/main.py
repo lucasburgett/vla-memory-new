@@ -99,6 +99,12 @@ def main() -> None:
                              "--only-tasks ButtonUnmaskSwap. Mutually exclusive with --joint-selection.")
     parser.add_argument("--streaming-max-picks", type=int, default=4,
                         help="Cap on decision points (picks) per streaming episode.")
+    parser.add_argument("--streaming-buffer-reset", action=argparse.BooleanOptionalAction, default=False,
+                        help="Clear the keyframe buffer before each pick instead of accumulating. "
+                             "Tests whether cross-pick buffer persistence is necessary.")
+    parser.add_argument("--streaming-no-fifo", action=argparse.BooleanOptionalAction, default=False,
+                        help="VLM sees only keyframe buffer + current frame, not the broad recent window. "
+                             "Tests whether FIFO context window is needed alongside keyframe memory.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--debug-subgoals", action="store_true",
                         help="Print each sampled subgoal's text + token count — "
@@ -220,6 +226,8 @@ def main() -> None:
         joint_selection=args.joint_selection,
         streaming_memory=args.streaming_memory,
         streaming_max_picks=args.streaming_max_picks,
+        streaming_buffer_reset=args.streaming_buffer_reset,
+        streaming_no_fifo=args.streaming_no_fifo,
         n_candidate_frames=args.n_candidate_frames,
         max_keyframes=args.max_keyframes,
         snapshot_branching=args.snapshot_branching,

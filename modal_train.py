@@ -1662,6 +1662,8 @@ def grpo(
                                       # keyframe buffer accumulates across picks → GRPO trains selection.
                                       # Use with only_tasks=ButtonUnmaskSwap. Excludes joint_selection.
     streaming_max_picks: int = 4,     # cap on decision points (picks) per streaming episode
+    streaming_buffer_reset: bool = False,  # clear buffer each pick instead of accumulating
+    streaming_no_fifo: bool = False,       # VLM sees only keyframe buffer + current frame
     n_candidate_frames: int = 12,     # SELECT-call candidate window (joint) / broad window (streaming)
     max_keyframes: int = 4,           # cap on kept keyframes (joint) / nominated per call (streaming)
     snapshot_branching: bool = False, # speed: warm once/group, snapshot+restore per candidate
@@ -1773,6 +1775,8 @@ def grpo(
     grpo_cmd.append("--joint-selection" if joint_selection else "--no-joint-selection")
     grpo_cmd.append("--streaming-memory" if streaming_memory else "--no-streaming-memory")
     grpo_cmd.append(f"--streaming-max-picks={streaming_max_picks}")
+    grpo_cmd.append("--streaming-buffer-reset" if streaming_buffer_reset else "--no-streaming-buffer-reset")
+    grpo_cmd.append("--streaming-no-fifo" if streaming_no_fifo else "--no-streaming-no-fifo")
     grpo_cmd.append("--snapshot-branching" if snapshot_branching else "--no-snapshot-branching")
     if debug_subgoals:
         grpo_cmd.append("--debug-subgoals")

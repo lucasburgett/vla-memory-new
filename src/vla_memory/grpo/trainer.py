@@ -68,6 +68,10 @@ class GRPOConfig:
                                            # One state/episode; trajectory = the per-pick calls sharing
                                            # the episode advantage. Mutually exclusive with the two above.
     streaming_max_picks: int = 4           # cap on decision points per streaming episode.
+    streaming_buffer_reset: bool = False   # clear the keyframe buffer before each pick (vs accumulate).
+                                           # Tests whether cross-pick buffer persistence is necessary.
+    streaming_no_fifo: bool = False        # VLM sees only keyframe buffer + current frame, NOT the broad
+                                           # recent window. Tests whether the FIFO context is needed.
     snapshot_branching: bool = False       # speed path: warm up ONCE per group, snapshot the env at
                                            # the decision point, restore it per candidate (instead of
                                            # re-warming K times). Off = rebuild path (the verified
@@ -481,7 +485,9 @@ class GRPOTrainer:
         rewards: List[float] = []
         for ci in range(self.cfg.group_size):
             gen = worker.rollout_streaming(
-                state.episode_id, seed=group_seed, max_picks=self.cfg.streaming_max_picks
+                state.episode_id, seed=group_seed, max_picks=self.cfg.streaming_max_picks,
+                buffer_reset=self.cfg.streaming_buffer_reset,
+                no_fifo=self.cfg.streaming_no_fifo,
             )
             traj: Trajectory = []
             try:

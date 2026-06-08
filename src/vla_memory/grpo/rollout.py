@@ -644,6 +644,8 @@ class RolloutWorker:
         seed: Optional[int] = None,
         max_picks: int = 4,
         per_pick_max_steps: Optional[int] = None,
+        buffer_reset: bool = False,
+        no_fifo: bool = False,
         recorder=None,
     ) -> Iterator[object]:
         """GENERATOR: the VLM owns the whole episode, accumulating a keyframe buffer
@@ -733,8 +735,8 @@ class RolloutWorker:
             # 2. At a pick decision point — hand the VLM the buffer + broad window.
             recent_frames, recent_steps = self._stream_window(captured, captured_steps, window_start)
             dp = DecisionPoint(
-                key_frames=buffer.frames(),       # accumulated memory (empty at pick 0)
-                recent_frames=recent_frames,      # broad window: ground current pick + nominate for later
+                key_frames=buffer.frames(),
+                recent_frames=[img] if no_fifo else recent_frames,
                 task_goal=task_goal,
                 history_subgoals=self._history_before_pick(phase_seq),
                 candidate_frames=recent_frames,
@@ -746,8 +748,13 @@ class RolloutWorker:
             sent = yield dp
             subtask_qwen, kf_positions = sent if sent is not None else ("", [])
 
-            # 3. Merge the nominated keyframes into the buffer (MemER clustering). Map
-            #    the validated 1-indexed positions back to their (frame, abs_step).
+            # 3. Merge nominated keyframes into the buffer.
+            # buffer_reset: clear before merging so each pick uses ONLY its own nominations
+            # (tests whether cross-pick buffer persistence is necessary).
+            if buffer_reset:
+                buffer = KeyframeBuffer(dist=self.keyframe_cluster_dist, cap=self.keyframe_buffer_cap)
+            # Always validate against the full candidate window (recent_frames), not the
+            # potentially truncated no_fifo=[img] view, so positions reference the same pool.
             kept_pos = valid_keyframe_positions(kf_positions, len(recent_frames), self.max_keyframes)
             buffer.merge([TaggedFrame(recent_frames[p - 1], recent_steps[p - 1]) for p in kept_pos])
 

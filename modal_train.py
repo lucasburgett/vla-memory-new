@@ -1798,10 +1798,9 @@ def grpo(
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoint convenience
+# PPO / RLOO / evaluate / pipeline — from Krish's branch
 # ---------------------------------------------------------------------------
 
-@app.local_entrypoint()
 def main(stage: str = "grpo"):
     """Run a single stage end-to-end. Example::
 
@@ -1835,5 +1834,648 @@ def main(stage: str = "grpo"):
         print(probe_snapshot_parity.remote())
     elif stage == "grpo":
         print(grpo.remote())
+    else:
+        raise SystemExit(f"unknown stage: {stage}")
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=24 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def ppo(
+    sft_adapter_path: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    output_dir: str = f"{MOUNT}/runs/ppo/buttonunmask_groundsg_v0",
+    num_steps: int = 200,
+    batch_states: int = 4,
+    rollouts_per_state: int = 8,
+    coeff_vf: float = 0.5,
+    kl_beta: float = 0.0,
+    learning_rate: float = 1e-4,
+    sample_temperature: float = 1.0,
+    rollouts_per_subgoal: int = 1,
+    rollout_max_steps: int = 200,
+    only_tasks: str = "ButtonUnmask",
+    episodes_per_task: int = 20,
+    subgoal_type: str = "grounded_subgoal",
+    seed: int = 0,
+    debug_subgoals: bool = False,
+) -> dict:
+    """PPO with a learned value baseline instead of GRPO's group mean.
+
+    Same infra as GRPO: frozen π0.5 server + micromamba robomme env for the
+    PPO loop. The PPOTrainer adds a ValueHead to QwenSubgoalPolicy and trains
+    it jointly with the LoRA adapter.
+    """
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting frozen π0.5 server on localhost:{port} …")
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}",
+            f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app",
+        env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("π0.5 policy server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("π0.5 server is up.")
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("π0.5 policy server did not become reachable")
+
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    Path(hf_cache_dir).mkdir(parents=True, exist_ok=True)
+    ppo_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "vla-memory-ppo"),
+        "WANDB_RUN_NAME": f"qwen-ppo-{int(time.time())}",
+    }
+    ppo_cmd = [
+        "micromamba", "run", "-n", "robomme",
+        "python", "-u", "/workspace/src/vla_memory/ppo/main.py",
+        f"--port={port}",
+        f"--sft-adapter-path={sft_adapter_path}",
+        f"--output-dir={output_dir}",
+        f"--num-steps={num_steps}",
+        f"--batch-states={batch_states}",
+        f"--rollouts-per-state={rollouts_per_state}",
+        f"--coeff-vf={coeff_vf}",
+        f"--kl-beta={kl_beta}",
+        f"--learning-rate={learning_rate}",
+        f"--sample-temperature={sample_temperature}",
+        f"--rollouts-per-subgoal={rollouts_per_subgoal}",
+        f"--rollout-max-steps={rollout_max_steps}",
+        f"--only-tasks={only_tasks}",
+        f"--episodes-per-task={episodes_per_task}",
+        f"--subgoal-type={subgoal_type}",
+        f"--seed={seed}",
+    ]
+    if debug_subgoals:
+        ppo_cmd.append("--debug-subgoals")
+    import shlex
+    print("Launching PPO main loop:", shlex.join(ppo_cmd), flush=True)
+    try:
+        subprocess.run(ppo_cmd, check=True, env=ppo_env, cwd="/workspace")
+    finally:
+        try:
+            volume.commit()
+        except Exception as commit_exc:
+            print(f"[ppo] volume.commit() failed: {commit_exc!r}", flush=True)
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+    return {"output_dir": output_dir, "log_path": str(Path(output_dir) / "train_log.jsonl")}
+
+
+# ---------------------------------------------------------------------------
+# Stage B.2 — RLOO (REINFORCE Leave-One-Out ablation)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=24 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def rloo(
+    sft_adapter_path: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    output_dir: str = f"{MOUNT}/runs/rloo/buttonunmask_groundsg_v0",
+    num_steps: int = 200,
+    batch_states: int = 4,
+    group_size: int = 8,
+    kl_beta: float = 0.0,
+    learning_rate: float = 1e-4,
+    sample_temperature: float = 1.0,
+    rollouts_per_subgoal: int = 1,
+    rollout_max_steps: int = 200,
+    only_tasks: str = "ButtonUnmask",
+    episodes_per_task: int = 20,
+    subgoal_type: str = "grounded_subgoal",
+    seed: int = 0,
+    debug_subgoals: bool = False,
+) -> dict:
+    """RLOO ablation: same as GRPO but leave-one-out advantage instead of group mean."""
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting frozen π0.5 server on localhost:{port} …")
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}",
+            f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app",
+        env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("π0.5 policy server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("π0.5 server is up.")
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("π0.5 policy server did not become reachable")
+
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    Path(hf_cache_dir).mkdir(parents=True, exist_ok=True)
+    rloo_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "vla-memory-rloo"),
+        "WANDB_RUN_NAME": f"qwen-rloo-{int(time.time())}",
+    }
+    rloo_cmd = [
+        "micromamba", "run", "-n", "robomme",
+        "python", "-u", "/workspace/src/vla_memory/rloo/main.py",
+        f"--port={port}",
+        f"--sft-adapter-path={sft_adapter_path}",
+        f"--output-dir={output_dir}",
+        f"--num-steps={num_steps}",
+        f"--batch-states={batch_states}",
+        f"--group-size={group_size}",
+        f"--kl-beta={kl_beta}",
+        f"--learning-rate={learning_rate}",
+        f"--sample-temperature={sample_temperature}",
+        f"--rollouts-per-subgoal={rollouts_per_subgoal}",
+        f"--rollout-max-steps={rollout_max_steps}",
+        f"--only-tasks={only_tasks}",
+        f"--episodes-per-task={episodes_per_task}",
+        f"--subgoal-type={subgoal_type}",
+        f"--seed={seed}",
+    ]
+    if debug_subgoals:
+        rloo_cmd.append("--debug-subgoals")
+    import shlex
+    print("Launching RLOO main loop:", shlex.join(rloo_cmd), flush=True)
+    try:
+        subprocess.run(rloo_cmd, check=True, env=rloo_env, cwd="/workspace")
+    finally:
+        try:
+            volume.commit()
+        except Exception as commit_exc:
+            print(f"[rloo] volume.commit() failed: {commit_exc!r}", flush=True)
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+    return {"output_dir": output_dir, "log_path": str(Path(output_dir) / "train_log.jsonl")}
+
+
+# ---------------------------------------------------------------------------
+# Stage D — Evaluate a trained PPO (or GRPO) Qwen adapter on ButtonUnmask val
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=2 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def evaluate(
+    adapter_path: str = "",  # empty string = zero-shot (base Qwen, no LoRA)
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    task: str = "ButtonUnmask",
+    n_episodes: int = 50,
+    dataset: str = "val",
+    subgoal_type: str = "grounded_subgoal",
+    n_key_frames: int = 4,
+    n_recent_frames: int = 2,
+    reveal_window: int = 64,
+    decision_warm_cap: int = 150,
+    rollout_max_steps: int = 100,
+    seed: int = 0,
+) -> dict:
+    """Evaluate a trained Qwen adapter on ButtonUnmask val episodes.
+
+    Runs greedy subgoal decoding (no sampling) through the full hierarchy:
+    Qwen → grounded subgoal → GroundSG π0.5 → ManiSkill.
+    Reports task success rate and mean progress across n_episodes.
+    """
+    import json as _json
+
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting GroundSG π0.5 server on localhost:{port} …", flush=True)
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}", f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app", env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("π0.5 server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("π0.5 server is up.", flush=True)
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("π0.5 server did not become reachable")
+
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    eval_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+    }
+
+    eval_script = f"""
+import sys
+sys.path.insert(0, "/workspace/src")
+sys.path.insert(0, "/app/examples/robomme")
+
+import json, torch
+from vla_memory.qwen_subgoal.model import QwenSubgoalPolicy
+from vla_memory.grpo.env_runner import EnvRunner
+from vla_memory.grpo.reward import RewardConfig, compute_reward
+from vla_memory.grpo.rollout import RolloutWorker
+from openpi_client import websocket_client_policy as _wp
+
+_adapter = "{adapter_path}" or None
+policy = QwenSubgoalPolicy(
+    adapter_init_path=_adapter,
+    torch_dtype=torch.bfloat16,
+    device="cuda",
+)
+reward_cfg = RewardConfig()
+results = []
+for ep in range({n_episodes}):
+    env_runner = EnvRunner(
+        env_id="{task}", video_save_dir="/tmp/eval_videos",
+        max_steps={rollout_max_steps}, dataset="{dataset}",
+    )
+    client = _wp.MMEVLAWebsocketClientPolicy("127.0.0.1", {port})
+    worker = RolloutWorker(
+        env_runner=env_runner, policy_client=client,
+        obs_horizon=16, max_steps={rollout_max_steps},
+        use_history=False, subgoal_type="{subgoal_type}",
+        decision_warm_cap={decision_warm_cap},
+        n_key_frames={n_key_frames}, n_recent_frames={n_recent_frames},
+        reveal_window={reveal_window}, n_candidate_frames=12,
+    )
+    try:
+        dp = worker.peek_at_decision_point(ep, seed={seed})
+        text, _ = policy.greedy_subgoal(
+            key_frames=dp.key_frames, recent_frames=dp.recent_frames,
+            task_goal=dp.task_goal, history_subgoals=dp.history_subgoals,
+        )
+        from vla_memory.qwen_subgoal.prompts import parse_subgoal_output
+        subtask, _ = parse_subgoal_output(text)
+        result = worker.rollout(episode_id=ep, sampled_subgoal=subtask, seed={seed})
+        reward = compute_reward(result.success_flag, result.progress, reward_cfg)
+        results.append({{"ep": ep, "subtask": subtask, "reward": reward,
+                         "success": result.success_flag, "progress": result.progress}})
+        print(f"ep={{ep:02d}} reward={{reward:.3f}} success={{result.success_flag}} subtask={{subtask[:60]!r}}", flush=True)
+    except Exception as e:
+        print(f"ep={{ep:02d}} ERROR: {{e!r}}", flush=True)
+        results.append({{"ep": ep, "error": repr(e), "reward": 0.0}})
+    finally:
+        worker.close()
+
+successes = sum(1 for r in results if r.get("success") == "success")
+mean_reward = sum(r.get("reward", 0) for r in results) / len(results)
+print(json.dumps({{"n_episodes": len(results), "successes": successes,
+                   "success_rate": successes/len(results), "mean_reward": mean_reward,
+                   "results": results}}))
+"""
+    out_path = f"{MOUNT}/runs/eval_{task}_{dataset}_{Path(adapter_path).name}.json"
+    try:
+        proc = subprocess.run(
+            ["micromamba", "run", "-n", "robomme", "python", "-u", "-c", eval_script],
+            env=eval_env, cwd="/workspace", capture_output=False,
+            text=True, timeout=7200,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"Eval script exited {proc.returncode}")
+    finally:
+        try:
+            volume.commit()
+        except Exception as e:
+            print(f"[eval] volume.commit() failed: {e!r}", flush=True)
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+    return {"output": out_path, "task": task, "dataset": dataset, "adapter": adapter_path}
+
+
+# ---------------------------------------------------------------------------
+# Stage C — Full pipeline (build_memory → sft → ppo), run detached
+#
+# Usage:
+#   modal run --detach modal_train.py --stage pipeline
+#
+# Runs all three stages in sequence inside Modal — no local process needed.
+# Safe to close your laptop after launching. Check progress with:
+#   modal app logs <app-id> --follow
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    timeout=24 * 3600,
+    volumes={MOUNT: volume},
+    secrets=[modal.Secret.from_dotenv(__file__)],
+)
+def pipeline(
+    raw_data_path: str = f"{MOUNT}/data/robomme_data_h5",
+    sft_output_dir: str = f"{MOUNT}/ckpts/qwen_sft/buttonunmask_grounded",
+    ppo_output_dir: str = f"{MOUNT}/runs/ppo/buttonunmask_groundsg_v0",
+    low_level_ckpt_dir: str = f"{MOUNT}/ckpts/mme_vla_suite/symbolic-grounded-subgoal/79999",
+    policy_config: str = "mme_vla_suite",
+    only_tasks: str = "ButtonUnmask",
+    num_sft_epochs: int = 5,
+    num_ppo_steps: int = 200,
+    seed: int = 0,
+) -> dict:
+    """build_memory → sft → ppo in ONE Modal function — safe to run with --detach.
+
+    Runs everything inline (no sub-.remote() calls) so a single A100-80GB
+    container handles the full pipeline. Close your laptop after launching::
+
+        modal run --detach modal_train.py --stage pipeline
+
+    Check progress::
+
+        modal app logs <app-id> --follow
+    """
+    hf_cache_dir = f"{MOUNT}/.cache/huggingface"
+    Path(hf_cache_dir).mkdir(parents=True, exist_ok=True)
+    base_env = {
+        **os.environ,
+        "USE_HF": "1",
+        "HF_HOME": hf_cache_dir,
+        "HF_HUB_CACHE": f"{hf_cache_dir}/hub",
+        "TRANSFORMERS_CACHE": f"{hf_cache_dir}/hub",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "IMAGE_MAX_TOKEN_NUM": "256",
+        "VIDEO_MAX_TOKEN_NUM": "64",
+        "FPS_MAX_FRAMES": "10",
+    }
+
+    # ------------------------------------------------------------------
+    # Stage 1: build_memory_dataset (CPU — Python in-process)
+    # ------------------------------------------------------------------
+    print("[pipeline] Stage 1/3: build_memory_dataset", flush=True)
+    jsonl_path = f"{MOUNT}/data/preprocessed/memory/grounded_subgoal_train.jsonl"
+    if Path(jsonl_path).exists():
+        print(f"[pipeline] dataset already exists at {jsonl_path}, skipping build", flush=True)
+        memory_paths = {"grounded_subgoal_train": jsonl_path}
+    else:
+        from vla_memory.data.build_memory_sft_dataset import build_memory_sft_dataset
+        memory_paths = build_memory_sft_dataset(
+            raw_data_path=raw_data_path,
+            preprocessed_data_path=f"{MOUNT}/data/preprocessed",
+            only_tasks=tuple(t for t in only_tasks.split(",") if t),
+            seed=seed,
+        )
+        volume.commit()
+    print(f"[pipeline] Stage 1 done: {memory_paths}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Stage 2: SFT warmstart (GPU — swift subprocess)
+    # ------------------------------------------------------------------
+    print("[pipeline] Stage 2/3: sft_warmstart", flush=True)
+    run_name = f"qwen-sft-memory-{int(time.time())}"
+    sft_env = {
+        **base_env,
+        "NPROC_PER_NODE": "1",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "vla-memory-sft"),
+        "WANDB_RUN_NAME": run_name,
+    }
+    sft_cmd = [
+        "swift", "sft",
+        "--model", "Qwen/Qwen3-VL-4B-Instruct",
+        "--use_hf", "true",
+        "--dataset", jsonl_path,
+        "--split_dataset_ratio", "0.05",
+        "--load_from_cache_file", "true",
+        "--packing", "false",
+        "--train_type", "lora",
+        "--torch_dtype", "bfloat16",
+        "--num_train_epochs", str(num_sft_epochs),
+        "--per_device_train_batch_size", "8",
+        "--gradient_accumulation_steps", "1",
+        "--attn_impl", "sdpa",
+        "--padding_free", "false",
+        "--learning_rate", "4e-6",
+        "--lora_rank", "8",
+        "--lora_alpha", "16",
+        "--lora_dropout", "0.1",
+        "--target_modules", "all-linear",
+        "--freeze_vit", "true",
+        "--freeze_aligner", "true",
+        "--gradient_checkpointing", "true",
+        "--vit_gradient_checkpointing", "false",
+        "--save_steps", "25",
+        "--save_total_limit", "20",
+        "--eval_steps", "25",
+        "--eval_strategy", "steps",
+        "--logging_steps", "10",
+        "--max_length", "4096",
+        "--output_dir", sft_output_dir,
+        "--warmup_ratio", "0.05",
+        "--average_tokens_across_devices", "true",
+        "--max_grad_norm", "0.5",
+        "--label_smoothing_factor", "0.0",
+        "--dataset_num_proc", "4",
+        "--dataloader_num_workers", "4",
+        "--report_to", "wandb" if os.environ.get("WANDB_API_KEY") else "none",
+        "--run_name", run_name,
+    ]
+    print("Running SFT:", " ".join(sft_cmd[:6]) + " ...", flush=True)
+    try:
+        subprocess.run(sft_cmd, check=True, env=sft_env, cwd="/workspace")
+    finally:
+        volume.commit()
+
+    # Resolve latest checkpoint
+    versioned_runs = sorted(Path(sft_output_dir).glob("v*-*"))
+    if not versioned_runs:
+        raise RuntimeError(f"No versioned SFT run under {sft_output_dir}")
+    checkpoints = list(versioned_runs[-1].glob("checkpoint-*"))
+    if not checkpoints:
+        raise RuntimeError(f"No checkpoint under {versioned_runs[-1]}")
+    sft_adapter = str(max(checkpoints, key=lambda p: int(p.name.split("-", 1)[1])))
+    print(f"[pipeline] Stage 2 done: {sft_adapter}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Stage 3: PPO (GPU — π0.5 server + micromamba PPO loop)
+    # ------------------------------------------------------------------
+    print("[pipeline] Stage 3/3: ppo", flush=True)
+    port = _free_port()
+    server_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "OPENPI_DATA_HOME": f"{MOUNT}/openpi",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    print(f"Starting π0.5 server on localhost:{port} …", flush=True)
+    server_proc = subprocess.Popen(
+        [
+            "uv", "run", "scripts/serve_policy.py",
+            f"--port={port}", f"--seed={seed}",
+            "policy:checkpoint",
+            f"--policy.dir={low_level_ckpt_dir}",
+            f"--policy.config={policy_config}",
+        ],
+        cwd="/app", env=server_env,
+    )
+    for _ in range(180):
+        if server_proc.poll() is not None:
+            raise RuntimeError("π0.5 server exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                print("π0.5 server is up.", flush=True)
+                break
+        except OSError:
+            time.sleep(1.0)
+    else:
+        raise TimeoutError("π0.5 server did not become reachable")
+
+    ppo_env = {
+        **base_env,
+        "CUDA_VISIBLE_DEVICES": "0",
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "vla-memory-ppo"),
+        "WANDB_RUN_NAME": f"qwen-ppo-{int(time.time())}",
+    }
+    ppo_cmd = [
+        "micromamba", "run", "-n", "robomme",
+        "python", "-u", "/workspace/src/vla_memory/ppo/main.py",
+        f"--port={port}",
+        f"--sft-adapter-path={sft_adapter}",
+        f"--output-dir={ppo_output_dir}",
+        f"--num-steps={num_ppo_steps}",
+        "--batch-states=4", "--rollouts-per-state=8",
+        "--only-tasks=ButtonUnmask", "--episodes-per-task=20",
+        "--subgoal-type=grounded_subgoal",
+        f"--seed={seed}",
+    ]
+    try:
+        subprocess.run(ppo_cmd, check=True, env=ppo_env, cwd="/workspace")
+    finally:
+        try:
+            volume.commit()
+        except Exception as e:
+            print(f"[pipeline] volume.commit() failed: {e!r}", flush=True)
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+
+    print(f"[pipeline] Stage 3 done: {ppo_output_dir}", flush=True)
+    return {"sft_adapter": sft_adapter, "ppo_output_dir": ppo_output_dir}
+
+
+# ---------------------------------------------------------------------------
+# Local entrypoint convenience
+# ---------------------------------------------------------------------------
+
+@app.local_entrypoint()
+def main(stage: str = "grpo"):
+    """Run a single stage end-to-end. Example::
+
+        modal run modal_train.py --stage download_data    # clone + decompress H5 demos (~30 GB)
+        modal run modal_train.py --stage download_groundsg # subgoal-conditioned π0.5 (~GB)
+        modal run modal_train.py --stage causality_probe   # BLOCKER check: does π0.5 read the subgoal?
+        modal run modal_train.py --stage build_dataset    # H5 -> QwenVL JSONL (simple subgoal)
+        modal run modal_train.py --stage build_memory     # H5 -> memory SFT JSONL (ButtonUnmask grounded)
+        modal run modal_train.py --stage sft              # SFT warmstart (memory data)
+        modal run modal_train.py --stage grpo             # GRPO fine-tune (Lucas)
+        modal run modal_train.py --stage ppo              # PPO with learned value baseline
+        modal run modal_train.py --stage rloo             # RLOO ablation (leave-one-out advantage)
+        modal run --detach modal_train.py --stage pipeline  # build_memory+sft+ppo, lid-safe
+    """
+    if stage == "download_data":
+        print(download_demonstrations.remote())
+    elif stage == "download_groundsg":
+        print(download_groundsg.remote())
+    elif stage == "causality_probe":
+        print(causality_probe.remote())
+    elif stage == "build_dataset":
+        print(build_dataset.remote())
+    elif stage == "build_memory":
+        print(build_memory_dataset.remote())
+    elif stage == "sft":
+        print(sft_warmstart.remote())
+    elif stage == "grpo":
+        print(grpo.remote())
+    elif stage == "ppo":
+        print(ppo.remote())
+    elif stage == "rloo":
+        print(rloo.remote())
+    elif stage == "pipeline":
+        print(pipeline.remote())
+    elif stage == "evaluate":
+        print(evaluate.remote())
     else:
         raise SystemExit(f"unknown stage: {stage}")

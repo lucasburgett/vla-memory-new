@@ -304,6 +304,7 @@ class QwenSubgoalPolicy:
         top_p: float = 0.95,
         has_video_demo: bool = False,
         debug: bool = False,
+        mode: str = "use",  # accepted for eval_streaming.py compatibility; unused here
     ) -> List[SampleResult]:
         """Draw ``k`` subgoal candidates for one memory state. Used for GRPO rollouts.
 
@@ -422,6 +423,7 @@ class QwenSubgoalPolicy:
         history_subgoals: Optional[List[str]] = None,
         has_video_demo: bool = False,
         max_new_tokens: int = 128,
+        mode: str = "use",  # accepted for eval_streaming.py compatibility; unused here
     ) -> Tuple[str, torch.Tensor]:
         """Deterministically greedy-decode ONE response. For eval / probe / validation.
 

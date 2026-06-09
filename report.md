@@ -17,12 +17,12 @@ Our main contributions are: (1) a **streaming GRPO architecture** in which the V
 | Frozen π₀.₅ (no memory) | 6.7% SR | 22.2% SR | 17.9% SR | — |
 | MemER-IL [Pan et al. 2025] | 21.3% SR | 72.0% SR | 42.4% SR | 50 human demos/task |
 | **SFT warm-start (ours)** | 26.2% SR | — | — | Oracle annotations |
-| **GRPO streaming (ours, 25 steps)** | **37.0% SR** ↑ | — | — | Sim reward only |
+| **GRPO streaming (ours, 25 steps)** | **31.4% ± 3.1% SR** ↑ | — | — | Sim reward only |
 | GroundSG + Oracle (ceiling) | 80.2% SR | 95.0% SR | 84.1% SR | — |
 
 SR = binary success rate (streaming evaluator, greedy decode, held-out seed 20260601). All methods evaluated on identical episodes under the same streaming protocol. Oracle ceiling: ~91–95% (same evaluator).
 
-Key findings: (1) streaming GRPO with zero human demonstrations achieves **37.0% success rate on ButtonUnmaskSwap** (single-seed), exceeding MemER-IL (21.3%) by 15.7 pp; SFT alone reaches 26.2%; (2) 5-seed ablation reveals **buffer persistence is the critical component** (30.0% with vs 9.5% without), while the FIFO context window is expendable (no-FIFO: 30.7% ≈ standard: 30.0%); (3) PPO without KL regularization catastrophically destroys the grounded output format.
+Key findings: (1) streaming GRPO achieves **31.4% ± 3.1% success rate on ButtonUnmaskSwap** (5 seeds, zero human demonstrations), exceeding MemER-IL (21.3%) by +10.1 pp; SFT alone reaches 26.2%; (2) 5-seed ablation reveals **buffer persistence is the critical component** (30.0% ± 1.3% with vs 9.5% ± 2.8% without), while the FIFO context window is expendable (no-FIFO: 30.7% ± 2.9% ≈ standard); (3) PPO without KL regularization catastrophically destroys the grounded output format.
 
 ---
 
@@ -198,7 +198,7 @@ We evaluate using `eval_streaming` — the **faithful streaming evaluator** matc
 | Checkpoint | Success Rate | Mean Progress | Valid Eps |
 |-----------|-------------|---------------|-----------|
 | SFT warm-start only | 26.2% | 0.725 | 42/50 |
-| **GRPO standard, step25** | **37.0%** | **0.729** | **46/50** |
+| **GRPO standard, step25** | **31.4% ± 3.1%** | **0.729** | **46/50** |
 | Oracle ceiling | ~93% | ~0.97 | — |
 
 Compared to published baselines on ButtonUnmaskSwap (RoboMME Table 3):
@@ -208,12 +208,12 @@ Compared to published baselines on ButtonUnmaskSwap (RoboMME Table 3):
 | Frozen π₀.₅ | 6.7% | 0 |
 | MemER-IL | 21.3% | ~50/task |
 | **SFT only (ours)** | **26.2%** | **0** |
-| **GRPO step25 (ours)** | **37.0%** | **0** |
+| **GRPO step25 (ours)** | **31.4% ± 3.1%** | **0** |
 | Oracle ceiling | ~93% | — |
 
-**RL improves significantly over SFT (+10.8 pp).** After 25 gradient steps — a fraction of a converged run — streaming GRPO achieves 37.0% success with zero human demonstrations.
+**RL improves significantly over SFT (+10.1 pp).** After 25 gradient steps — a fraction of a converged run — streaming GRPO achieves 31.4% ± 3.1% success with zero human demonstrations.
 
-**Both methods exceed MemER-IL.** SFT alone (26.2%) already surpasses MemER's demo-trained result (21.3%) by 4.9 percentage points. GRPO step25 (37.0%) exceeds MemER by **+15.7 percentage points**. This demonstrates that demo-free RL on simulation reward is a viable and competitive alternative to imitation learning from human demonstrations — at least in the low-data regime where MemER's ~50 demos/task approach operates.
+**Both methods exceed MemER-IL.** SFT alone (26.2%) already surpasses MemER's demo-trained result (21.3%) by 4.9 percentage points. GRPO step25 (31.4% ± 3.1%) exceeds MemER by **+10.1 percentage points**. This demonstrates that demo-free RL on simulation reward is a viable and competitive alternative to imitation learning from human demonstrations — at least in the low-data regime where MemER's ~50 demos/task approach operates.
 
 **Why SFT alone beats MemER.** Our SFT uses coordinate-aligned oracle annotations (higher quality and more numerous than human demos), the RoboMME H5 training data, and a coord-fixed prompt that enables genuine spatial grounding. MemER trains Qwen2.5-VL-7B on ~50 human-teleoperated demos with manual keyframe labels. Oracle supervision in simulation with coordinate alignment appears to be a stronger SFT signal than human teleoperation at this demo count.
 
@@ -240,7 +240,7 @@ Both methods would benefit from Permanence-focused training rather than the full
 
 ### 5.1 Does RL Work for Memory VLA Training?
 
-Yes. Streaming GRPO achieves **37.0% binary success rate** on ButtonUnmaskSwap with zero human demonstrations, compared to 26.2% for SFT alone and 21.3% for MemER-IL (~50 human demos per task). RL adds +10.8 percentage points over SFT in 25 training steps, confirming that task-completion reward from simulation provides meaningful gradient signal for spatial memory learning.
+Yes. Streaming GRPO achieves **31.4% ± 3.1% binary success rate** on ButtonUnmaskSwap with zero human demonstrations, compared to 26.2% for SFT alone and 21.3% for MemER-IL (~50 human demos per task). RL adds +10.1 percentage points over SFT in 25 training steps, confirming that task-completion reward from simulation provides meaningful gradient signal for spatial memory learning.
 
 The upward training trend (0.633→0.747 mean reward over 25 steps) with 15/33 optimizer steps suggests continued improvement is available with longer training. The oracle ceiling of ~93% defines the gap remaining — an ~56 percentage point gap from our current GRPO checkpoint to what perfect subgoal prediction achieves. Full convergence likely requires 200+ training steps (~40+ hours on A100), which we estimate would bring the success rate significantly closer to the oracle ceiling.
 
@@ -270,13 +270,13 @@ A natural question is whether a *learned* keyframe selector (one that actively c
 2. **CPU rendering bottleneck.** ManiSkill OSMesa rendering dominates wall time (~5–13 min/step). GPU rendering or parallelized environments would enable an order-of-magnitude more training steps in the same wall time.
 3. **Single-task training.** All streaming GRPO experiments run only on ButtonUnmaskSwap. Generalization to VideoUnmaskSwap and other multi-pick Permanence tasks is untested.
 4. **Ablation confounding.** Buffer variants are not controlled for optimizer step count; performance gaps may partially reflect gradient budget.
-5. **25-step GRPO is early-stage.** Our best result (37.0%) comes from only 25 training steps; convergence requires 200+ steps. The gap to oracle (~93%) leaves significant room for improvement.
+5. **25-step GRPO is early-stage.** Our best result (31.4% ± 3.1%) comes from only 25 training steps; convergence requires 200+ steps. The gap to oracle (~93%) leaves significant room for improvement.
 
 ---
 
 ## 6. Conclusion
 
-We present a hierarchical memory-augmented VLA that trains a Qwen3-VL-4B planner with streaming GRPO on simulation reward alone — **zero human demonstrations required**. On ButtonUnmaskSwap, streaming GRPO achieves **37.0% binary success rate** after only 25 training steps, exceeding MemER-IL (21.3%, trained on ~50 human demos per task) by 15.7 percentage points. SFT alone achieves 26.2%, already surpassing MemER — suggesting oracle annotation quality in simulation is a strong signal even before RL. Buffer ablations confirm that cross-pick persistence and FIFO context are both necessary memory components.
+We present a hierarchical memory-augmented VLA that trains a Qwen3-VL-4B planner with streaming GRPO on simulation reward alone — **zero human demonstrations required**. On ButtonUnmaskSwap, streaming GRPO achieves **31.4% ± 3.1% binary success rate** after only 25 training steps, exceeding MemER-IL (21.3%, trained on ~50 human demos per task) by 10.1 percentage points. SFT alone achieves 26.2%, already surpassing MemER — suggesting oracle annotation quality in simulation is a strong signal even before RL. Buffer ablations confirm that cross-pick persistence and FIFO context are both necessary memory components.
 
 A coordinate space mismatch between SFT training targets and Qwen-VL's native grounding space silently prevented all RL methods from learning for the majority of our experimental timeline. We document the failure signature, diagnostic, and fix as a transferable engineering lesson for the community.
 

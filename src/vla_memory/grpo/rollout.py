@@ -21,9 +21,16 @@ warm-up is oracle-driven and the reveal is timestep-deterministic, so it
 reproduces the same decision state up to π0.5 sampling noise) and then runs
 step 3 with the candidate.
 
-TODO(optimization): snapshot the env at the decision point with
-``env.get_state()`` once per group and ``set_state()`` for each candidate, instead
-of re-warming K times. Correct but slower today.
+SNAPSHOT BRANCHING (the speed path, opt-in): re-warming K times pays
+``make_env`` + ~150–410 oracle inference steps per candidate, which dominates
+wall-clock. ``peek_and_snapshot`` warms up ONCE and captures the env at the
+decision point (``env_snapshot.snapshot_env`` — physics + the whole wrapper
+chain's bookkeeping); ``rollout_from_snapshot`` restores that snapshot and runs
+only step 3. The trainer enables this via ``GRPOConfig.snapshot_branching``;
+``env_snapshot`` documents why a bare ``get_state_dict`` is insufficient, and
+``snapshot_parity_probe.py`` certifies that a restored env reproduces an
+identical reward + task-index trajectory bit-for-bit. The rebuild path
+(``peek_at_decision_point`` + ``rollout``) is preserved unchanged as the default.
 """
 
 from __future__ import annotations
@@ -31,9 +38,14 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections import deque
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from vla_memory.grpo.env_snapshot import EnvSnapshot, _copy_value, restore_env, snapshot_env
+from vla_memory.grpo.keyframe_buffer import KeyframeBuffer, TaggedFrame
+from vla_memory.grpo.selection import valid_keyframe_positions
+from vla_memory.qwen_subgoal.coords import from_qwen_xy
 
 
 @dataclasses.dataclass
@@ -63,6 +75,37 @@ class DecisionPoint:
     current_frame: Optional[np.ndarray] = None
 
 
+@dataclasses.dataclass
+class Snapshot:
+    """Everything needed to branch a candidate rollout from the decision point
+    WITHOUT re-warming: the captured env state plus the live stepping carry.
+
+    ``env`` is the physics + full-wrapper-chain bookkeeping snapshot. The carry
+    fields are the warm-up's exit state — copied (np arrays, deque contents as
+    lists) so the snapshot is immutable across the K candidates restored from it.
+    """
+
+    env: EnvSnapshot
+    task_goal: str
+    n_steps: int
+    exec_start_idx: int
+    terminated: bool
+    success_flag: str
+    img: Optional[np.ndarray]
+    wrist: Optional[np.ndarray]
+    robot_state: Optional[np.ndarray]
+    image_buf: List[np.ndarray]
+    wrist_buf: List[np.ndarray]
+    state_buf: List[np.ndarray]
+    # ``EnvRunner.info`` lives on the runner, NOT the wrapper chain — so
+    # ``restore_env`` (which only touches ``env_runner.env``) leaves it stale. It
+    # carries the oracle subgoals + ``status``; we restore it for a consistent
+    # post-restore runner state (candidate execution re-reads its own subgoal and
+    # ``step`` refreshes ``info``, so this matters mainly for correctness hygiene
+    # and the parity probe's invariant check).
+    info: Optional[dict] = None
+
+
 class RolloutWorker:
     """Wraps an openpi WebSocket client + an ``EnvRunner`` from the submodule.
 
@@ -84,6 +127,9 @@ class RolloutWorker:
         n_recent_frames: int = 2,         # recent execution frames (current context)
         reveal_window: int = 64,          # steps over which the scene reveals (ButtonUnmask: 0–64)
         n_candidate_frames: int = 12,     # joint SELECT call: breadth of the candidate window
+        max_keyframes: int = 4,           # streaming: cap on positions nominated per call
+        keyframe_buffer_cap: int = 8,     # streaming: cap on the accumulated keyframe buffer (MemER ≤8)
+        keyframe_cluster_dist: int = 8,   # streaming: merge nominations within this many steps (MemER d=8)
     ) -> None:
         self.env_runner = env_runner
         self.client = policy_client
@@ -98,6 +144,9 @@ class RolloutWorker:
         self.n_recent_frames = n_recent_frames
         self.reveal_window = reveal_window
         self.n_candidate_frames = n_candidate_frames
+        self.max_keyframes = max_keyframes
+        self.keyframe_buffer_cap = keyframe_buffer_cap
+        self.keyframe_cluster_dist = keyframe_cluster_dist
         self._env_open = False
         self._cached_episode_id: Optional[int] = None
 
@@ -119,11 +168,13 @@ class RolloutWorker:
         cached-reset path does not. ``seed`` pins the scene so a group's rollouts
         share the same cube→container layout (seed-shuffled).
 
-        TODO(perf): rebuilding per rollout pays ``make_env`` every time. The right
-        optimization is ``env.get_state``/``set_state`` to snapshot the decision
-        point once per group and branch K candidates from it — which also removes
-        the warm-up sampling noise between candidates. Deferred until the loop is
-        validated end-to-end.
+        PERF: rebuilding per rollout pays ``make_env`` every time. The snapshot
+        path (``peek_and_snapshot`` → ``rollout_from_snapshot``, enabled by
+        ``GRPOConfig.snapshot_branching``) bypasses this entirely: it warms up
+        ONCE, calls ``env_snapshot.snapshot_env`` here-equivalent state, and
+        ``restore_env``s it per candidate — also removing the warm-up sampling
+        noise between candidates. This rebuild path stays the default and the
+        verified fallback (see ``snapshot_parity_probe.py``).
         """
         if self._env_open:
             try:
@@ -177,16 +228,28 @@ class RolloutWorker:
     # Warm-up to the mid-episode decision point
     # ------------------------------------------------------------------
 
-    def _warmup(
-        self, episode_id: int, seed: Optional[int]
-    ) -> Tuple[List[np.ndarray], str, int, bool, str, Tuple]:
-        """Reset and drive the env with the ORACLE subgoal until the subgoal phase
-        changes (the memory decision point) or a cap/termination is hit.
+    @staticmethod
+    def _history_before_pick(phase_seq: List[str]) -> List[str]:
+        """Distinct completed subtasks before the target pick. If we stopped ON a pick
+        (last phase is a pick), drop it; otherwise return the non-pick phases seen.
+        On Swap pick 2 this yields [press1, press2, pick-1, put-down] → the prompt tells
+        the model which colour it's now on."""
+        if phase_seq and "pick up the container" in phase_seq[-1]:
+            return list(phase_seq[:-1])
+        return [p for p in phase_seq if "pick up the container" not in p]
 
-        Returns ``(captured_frames, task_goal, n_steps, terminated, success_flag,
-        carry)`` where ``carry`` is the live ``(img, wrist, state, image_buf,
-        wrist_buf, state_buf, exec_start_idx)`` needed to keep stepping in
-        ``rollout`` without re-resetting.
+    def _warmup(
+        self, episode_id: int, seed: Optional[int], pick_index: int = 0
+    ) -> Tuple[List[np.ndarray], str, int, bool, str, Tuple, List[str]]:
+        """Reset and drive the env with the ORACLE subgoal up to the ``pick_index``-th
+        PICK (the memory decision point) or a cap/termination.
+
+        For multi-pick tasks the oracle EXECUTES picks 0..pick_index-1 (and the
+        put-downs between them) on the way, so the VLM owns pick ``pick_index`` with the
+        earlier picks correctly done — that's how each pick earns its own reward.
+        Returns ``(captured, task_goal, n_steps, terminated, success_flag, carry,
+        history)``; ``carry`` is the live stepping state and ``history`` the distinct
+        completed subtasks before the target pick (prompt parity with the builder).
         """
         resp = self.client.reset()
         while not resp.get("reset_finished", False):
@@ -201,14 +264,31 @@ class RolloutWorker:
 
         img, wrist, robot_state = image_buf[-1], wrist_buf[-1], state_buf[-1]
         captured: List[np.ndarray] = [img]
-        phase0 = self._simple_phase(self.env_runner)
 
+        # Distinct simple phases in order of first appearance (dedup consecutive). The
+        # decision point is the (pick_index+1)-th PICK phase; the oracle drives through
+        # earlier picks/put-downs to get there. ButtonUnmask (pick_index 0) stops at the
+        # one press→pick transition exactly as before (parity).
+        phase_seq: List[str] = []
+
+        def _push(phase: str) -> None:
+            if phase and (not phase_seq or phase_seq[-1] != phase):
+                phase_seq.append(phase)
+
+        def _pick_count() -> int:
+            return sum(1 for p in phase_seq if "pick up the container" in p)
+
+        _push(self._simple_phase(self.env_runner))
+
+        # Later picks need a proportionally longer warm-up (ButtonUnmaskSwap: pick 1
+        # ~rel 180, pick 2 ~rel 410), so scale the cap by the pick index.
+        cap = self.decision_warm_cap * (pick_index + 1)
         n_steps = 0
         success_flag = "unknown"
         terminated = False
-        reached_transition = False
+        reached_transition = _pick_count() >= pick_index + 1
 
-        while n_steps < self.decision_warm_cap:
+        while n_steps < cap and not reached_transition:
             subgoal = self._oracle_subgoal()
             actions = self._infer_actions(
                 img, wrist, robot_state, task_goal, subgoal=subgoal,
@@ -219,7 +299,7 @@ class RolloutWorker:
                 if img is None:
                     return captured, task_goal, n_steps, True, "error", (
                         None, None, None, image_buf, wrist_buf, state_buf, exec_start_idx
-                    ), phase0
+                    ), self._history_before_pick(phase_seq)
                 image_buf.append(img)
                 wrist_buf.append(wrist)
                 state_buf.append(robot_state)
@@ -228,19 +308,18 @@ class RolloutWorker:
                 if stop:
                     terminated = True
                     break
-                # Decision point: the oracle has moved on from the warm-up phase
-                # (e.g. "press the button" → "pick the container …"). Stop the
-                # instant the new phase appears so the VLM owns that decision.
-                if self._simple_phase(self.env_runner) != phase0:
+                _push(self._simple_phase(self.env_runner))
+                if _pick_count() >= pick_index + 1:
                     reached_transition = True
                     break
-                if n_steps >= self.decision_warm_cap:
+                if n_steps >= cap:
                     break
-            if terminated or reached_transition or n_steps >= self.decision_warm_cap:
+            if terminated or reached_transition or n_steps >= cap:
                 break
 
+        history = self._history_before_pick(phase_seq)
         carry = (img, wrist, robot_state, image_buf, wrist_buf, state_buf, exec_start_idx)
-        return captured, task_goal, n_steps, terminated, success_flag, carry, phase0
+        return captured, task_goal, n_steps, terminated, success_flag, carry, history
 
     def _select_memory_frames(
         self, captured: Sequence[np.ndarray], warm_steps: int
@@ -290,34 +369,87 @@ class RolloutWorker:
                 out.append(captured[i])
         return out
 
-    def peek_at_decision_point(
-        self, episode_id: int, seed: Optional[int] = None
+    def _build_decision_point(
+        self,
+        captured: List[np.ndarray],
+        warm_steps: int,
+        task_goal: str,
+        history: List[str],
+        terminated: bool,
+        success_flag: str,
     ) -> DecisionPoint:
-        """Warm up to the memory decision point and return what the VLM conditions on.
-
-        Call once per state before sampling K candidates; then call ``rollout``
-        for each candidate with the same ``episode_id``/``seed``. Each call
-        rebuilds the env from the seed (so the cube→container layout matches what
-        the VLM saw here) and warms up afresh to the decision point.
-        """
-        captured, task_goal, warm_steps, terminated, success_flag, _, phase0 = self._warmup(
-            episode_id, seed
-        )
+        """Assemble the ``DecisionPoint`` (VLM-conditioning view) from warm-up
+        output. Shared by ``peek_at_decision_point`` (rebuild path) and
+        ``peek_and_snapshot`` (snapshot path) so both expose the same frames."""
         key_frames, recent_frames = self._select_memory_frames(captured, warm_steps)
         candidate_frames = self._select_candidate_frames(captured)
         return DecisionPoint(
             key_frames=key_frames,
             recent_frames=recent_frames,
             task_goal=task_goal,
-            # The completed-subtask timing signal (e.g. "press the button"); the
-            # SFT prompt carries the same line so train/inference agree.
-            history_subgoals=[phase0] if phase0 else [],
+            # The completed-subtask timing signal (e.g. ["press the button"], or both
+            # presses on ButtonUnmaskSwap); the SFT prompt carries the same line so
+            # train/inference agree (prompt parity).
+            history_subgoals=history,
             candidate_frames=candidate_frames,
             current_frame=captured[-1] if captured else None,
             warm_steps=warm_steps,
             terminated_early=terminated,
             success_flag=success_flag,
         )
+
+    def peek_at_decision_point(
+        self, episode_id: int, seed: Optional[int] = None, pick_index: int = 0
+    ) -> DecisionPoint:
+        """Warm up to the ``pick_index``-th memory decision point and return what the
+        VLM conditions on.
+
+        Call once per state before sampling K candidates; then call ``rollout``
+        for each candidate with the same ``episode_id``/``seed``/``pick_index``. Each
+        call rebuilds the env from the seed (so the layout matches what the VLM saw
+        here) and warms up afresh to the same pick.
+        """
+        captured, task_goal, warm_steps, terminated, success_flag, _, history = self._warmup(
+            episode_id, seed, pick_index=pick_index
+        )
+        return self._build_decision_point(
+            captured, warm_steps, task_goal, history, terminated, success_flag
+        )
+
+    def peek_and_snapshot(
+        self, episode_id: int, seed: Optional[int] = None, pick_index: int = 0
+    ) -> Tuple[DecisionPoint, Snapshot]:
+        """Warm up ONCE and return the decision point AND a restorable env snapshot.
+
+        The speed path: instead of re-warming for each of the K candidates, the
+        trainer calls this once, then ``rollout_from_snapshot`` per candidate. The
+        env is left OPEN (no ``close_env``/``make_env``) so ``restore_env`` can
+        rewind it in place. Captures the env state (physics + full wrapper chain)
+        plus the warm-up's exit carry (copied so the snapshot survives K restores).
+        """
+        captured, task_goal, warm_steps, terminated, success_flag, carry, history = self._warmup(
+            episode_id, seed, pick_index=pick_index
+        )
+        dp = self._build_decision_point(
+            captured, warm_steps, task_goal, history, terminated, success_flag
+        )
+        img, wrist, robot_state, image_buf, wrist_buf, state_buf, exec_start_idx = carry
+        snapshot = Snapshot(
+            env=snapshot_env(self.env_runner.env),
+            task_goal=task_goal,
+            n_steps=warm_steps,
+            exec_start_idx=exec_start_idx,
+            terminated=terminated,
+            success_flag=success_flag,
+            img=None if img is None else img.copy(),
+            wrist=None if wrist is None else wrist.copy(),
+            robot_state=None if robot_state is None else robot_state.copy(),
+            image_buf=[f.copy() for f in image_buf],
+            wrist_buf=[f.copy() for f in wrist_buf],
+            state_buf=[s.copy() for s in state_buf],
+            info=_copy_value(getattr(self.env_runner, "info", None)),
+        )
+        return dp, snapshot
 
     # ------------------------------------------------------------------
     # Rollout under a candidate subgoal
@@ -328,13 +460,22 @@ class RolloutWorker:
         episode_id: int,
         sampled_subgoal: str,
         seed: Optional[int] = None,
+        pick_index: int = 0,
     ) -> RolloutResult:
-        """Warm up to the decision point (oracle-driven), then execute
-        ``sampled_subgoal`` to the episode end and score the outcome."""
-        from vla_memory.qwen_subgoal.coords import from_qwen_xy
+        """Warm up to the ``pick_index``-th decision point (oracle-driven, executing
+        earlier picks), then execute ``sampled_subgoal`` to the episode end and score
+        the outcome. Reward = absolute progress: later picks have a higher floor (the
+        oracle's earlier picks) but GRPO's within-group advantage is relative, so the
+        floor cancels and each pick's selection still gets a clean gradient."""
+        # ``sampled_subgoal`` is the VLM's prediction in Qwen-native <x,y> 0–1000
+        # (the SFT target space). GroundSG was trained on the oracle's <y,x> 0–256
+        # PIXEL format, so convert here — the SINGLE point where VLM output reaches
+        # the executor (the oracle warm-up below and rollout_oracle use native
+        # coords and must NOT be converted). Skipping this feeds GroundSG a wrong
+        # coordinate → silently wrong reward → fake flatline. See coords.from_qwen_xy.
         sampled_subgoal = from_qwen_xy(sampled_subgoal)
-        captured, task_goal, n_steps, terminated, success_flag, carry, _phase0 = self._warmup(
-            episode_id, seed
+        captured, task_goal, n_steps, terminated, success_flag, carry, _history = self._warmup(
+            episode_id, seed, pick_index=pick_index
         )
         img, wrist, robot_state, image_buf, wrist_buf, state_buf, exec_start_idx = carry
 
@@ -343,6 +484,70 @@ class RolloutWorker:
         if terminated or img is None:
             return self._finalize(success_flag, image_buf[-1], n_steps)
 
+        return self._execute_forward(
+            sampled_subgoal, task_goal, img, wrist, robot_state,
+            image_buf, wrist_buf, state_buf, exec_start_idx, n_steps, success_flag,
+        )
+
+    def rollout_from_snapshot(
+        self, snapshot: Snapshot, sampled_subgoal: str
+    ) -> RolloutResult:
+        """Branch a candidate from a ``peek_and_snapshot`` snapshot: restore the
+        decision-point env in place, then execute ``sampled_subgoal`` to the end.
+
+        Replaces the per-candidate warm-up (env rebuild + oracle re-drive) with a
+        ``restore_env`` — the whole point of the optimization. Forward execution is
+        byte-identical to ``rollout`` (shared ``_execute_forward``). ``from_qwen_xy``
+        still converts the VLM coordinate at this single point (same as ``rollout``).
+        """
+        sampled_subgoal = from_qwen_xy(sampled_subgoal)
+        # The policy server accumulates a history buffer only when use_history is on.
+        # We skip the re-warm here, so reset the server per candidate to avoid leaking
+        # the prior candidate's frames. GRPO runs use_history=False → infer is
+        # stateless → no reset needed (and we avoid the reset round-trip).
+        if self.use_history:
+            resp = self.client.reset()
+            while not resp.get("reset_finished", False):
+                time.sleep(0.1)
+
+        restore_env(self.env_runner.env, snapshot.env)
+        if snapshot.info is not None:
+            # info lives on the runner, outside the wrapper chain restore_env touches.
+            self.env_runner.info = _copy_value(snapshot.info)
+        image_buf = deque(snapshot.image_buf, maxlen=64)
+        wrist_buf = deque(snapshot.wrist_buf, maxlen=64)
+        state_buf = deque(snapshot.state_buf, maxlen=64)
+        img = None if snapshot.img is None else snapshot.img.copy()
+        wrist = None if snapshot.wrist is None else snapshot.wrist.copy()
+        robot_state = None if snapshot.robot_state is None else snapshot.robot_state.copy()
+
+        if snapshot.terminated or img is None:
+            last = image_buf[-1] if image_buf else img
+            return self._finalize(snapshot.success_flag, last, snapshot.n_steps)
+
+        return self._execute_forward(
+            sampled_subgoal, snapshot.task_goal, img, wrist, robot_state,
+            image_buf, wrist_buf, state_buf, snapshot.exec_start_idx,
+            snapshot.n_steps, snapshot.success_flag,
+        )
+
+    def _execute_forward(
+        self,
+        sampled_subgoal: str,
+        task_goal: str,
+        img: np.ndarray,
+        wrist: np.ndarray,
+        robot_state: np.ndarray,
+        image_buf,
+        wrist_buf,
+        state_buf,
+        exec_start_idx: int,
+        n_steps: int,
+        success_flag: str,
+    ) -> RolloutResult:
+        """Step ``sampled_subgoal`` from the (warmed-or-restored) decision state to
+        the episode end and score the outcome. Identical body for both the rebuild
+        (``rollout``) and snapshot (``rollout_from_snapshot``) paths."""
         while n_steps < self.max_steps:
             actions = self._infer_actions(
                 img, wrist, robot_state, task_goal, subgoal=sampled_subgoal,
@@ -365,8 +570,233 @@ class RolloutWorker:
             success_flag = "timeout"
         return self._finalize(success_flag, img, n_steps)
 
+    # ------------------------------------------------------------------
+    # Decision-point STREAMING (MemER-faithful single-call output + GRPO)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_pick_phase(phase: str) -> bool:
+        """True iff the simple oracle phase is a memory-dependent PICK (the
+        decision the VLM owns). The put-downs / presses / approaches around it are
+        deterministic scaffolding the oracle drives. Same substring the per-pick
+        path keys on (``_warmup`` / ``_history_before_pick``) → consistent."""
+        return "pick up the container" in phase
+
+    def _stream_apply(
+        self, actions, image_buf, wrist_buf, state_buf, captured, captured_steps, n_steps,
+        recorder=None, subgoal=None,
+    ):
+        """Apply ONE inferred action chunk, updating the rolling buffers and the
+        unbounded (frame, abs_step) capture. Returns
+        ``(img, wrist, robot_state, n_steps, stop, success_flag, dead)`` — ``dead``
+        is True iff the sim returned a None frame (error). Shared by the oracle-scaffold
+        and VLM-pick loops of ``rollout_streaming`` so the stepping/capture is in one place.
+
+        ``recorder`` (eval-only, default None) is the submodule's ``RolloutRecorder``;
+        when provided, each stepped frame is annotated with ``subgoal`` and appended to
+        the video. None in training → this is a no-op and the path is byte-identical.
+        """
+        img = wrist = robot_state = None
+        stop = False
+        success_flag = "unknown"
+        for action in actions:
+            (img, wrist, robot_state), stop, success_flag = self.env_runner.step(action)
+            n_steps += 1
+            if img is None:
+                return None, None, None, n_steps, True, "error", True
+            image_buf.append(img)
+            wrist_buf.append(wrist)
+            state_buf.append(robot_state)
+            captured.append(img)
+            captured_steps.append(n_steps)
+            if recorder is not None:
+                recorder.record(img, wrist, robot_state, subgoal=subgoal)
+            if stop or n_steps >= self.max_steps:
+                break
+        return img, wrist, robot_state, n_steps, stop, success_flag, False
+
+    def _stream_window(
+        self, captured: List[np.ndarray], captured_steps: List[int], start: int
+    ) -> Tuple[List[np.ndarray], List[int]]:
+        """The broad recent window for a pick: ``n_candidate_frames`` evenly-spaced
+        frames from ``captured[start:]`` with their absolute steps. For pick 0
+        (``start=0``) this spans reveal→swaps→approach, so the VLM can both ground the
+        current pick AND nominate the post-swap frames it will need for a LATER pick."""
+        sub = captured[start:]
+        sub_steps = captured_steps[start:]
+        n = len(sub)
+        if n == 0:
+            return [], []
+        if n <= self.n_candidate_frames:
+            return list(sub), list(sub_steps)
+        idxs = np.linspace(0, n - 1, num=self.n_candidate_frames, dtype=int).tolist()
+        seen, fr, st = set(), [], []
+        for i in idxs:
+            if i not in seen:
+                seen.add(i)
+                fr.append(sub[i])
+                st.append(sub_steps[i])
+        return fr, st
+
+    def rollout_streaming(
+        self,
+        episode_id: int,
+        seed: Optional[int] = None,
+        max_picks: int = 4,
+        per_pick_max_steps: Optional[int] = None,
+        buffer_reset: bool = False,
+        no_fifo: bool = False,
+        recorder=None,
+    ) -> Iterator[object]:
+        """GENERATOR: the VLM owns the whole episode, accumulating a keyframe buffer
+        across pick decision points — MemER's mechanism, single-call output, trained
+        with GRPO (JOINT/STREAMING design). Drive it from the trainer:
+
+            gen = worker.rollout_streaming(ep, seed)
+            dp = next(gen)
+            while isinstance(dp, DecisionPoint):
+                cand = policy.sample_subgoals(key_frames=dp.key_frames,
+                            recent_frames=dp.recent_frames, ..., k=1, mode="use")[0]
+                dp = gen.send((cand.subtask, cand.keyframe_positions))
+            reward = compute_reward(dp.success_flag, dp.progress, cfg)   # dp is RolloutResult
+
+        At each pick the VLM sees ``key_frames`` = the accumulated buffer (empty at
+        pick 0) + ``recent_frames`` = a broad window, and emits ONE
+        ``{current_subtask, keyframe_positions}``. The nominated positions merge into
+        the buffer (MemER clustering); what's kept at pick 0 (whose window spans the
+        reveal+swaps) is the ONLY memory of pick 1's now-occluded target → selection
+        causally moves reward. The oracle drives the presses / put-downs between
+        picks; the VLM owns each grounded pick. ``from_qwen_xy`` converts the VLM
+        coordinate at the SINGLE point it reaches the executor (oracle subgoals are
+        NOT converted). The worker owns env lifecycle (the env is NOT closed here —
+        the trainer closes the worker after the group, as ``rollout`` does)."""
+        per_pick_cap = per_pick_max_steps or self.decision_warm_cap
+
+        resp = self.client.reset()
+        while not resp.get("reset_finished", False):
+            time.sleep(0.1)
+
+        init = self._ensure_env(episode_id, seed=seed)
+        image_buf = deque(init["images"], maxlen=64)
+        wrist_buf = deque(init["wrist_images"], maxlen=64)
+        state_buf = deque(init["states"], maxlen=64)
+        exec_start_idx = len(image_buf) - 1
+        task_goal = init["task_goal"]
+        if recorder is not None:
+            recorder.task_goal = task_goal   # overlay the real per-episode instruction
+        img, wrist, robot_state = image_buf[-1], wrist_buf[-1], state_buf[-1]
+
+        n_steps = 0
+        success_flag = "unknown"
+        # Unbounded capture (an episode is < rollout_max_steps, cheap) so the early
+        # reveal frames survive for the buffer; the rolling buffers above stay maxlen-64.
+        captured: List[np.ndarray] = [img]
+        captured_steps: List[int] = [n_steps]
+        phase_seq: List[str] = []
+
+        def _push(phase: str) -> None:
+            if phase and (not phase_seq or phase_seq[-1] != phase):
+                phase_seq.append(phase)
+
+        _push(self._simple_phase(self.env_runner))
+        buffer = KeyframeBuffer(dist=self.keyframe_cluster_dist, cap=self.keyframe_buffer_cap)
+        picks_done = 0
+        window_start = 0   # index into `captured` where THIS pick's broad window begins
+
+        while picks_done < max_picks:
+            # 1. Oracle-drive the deterministic scaffolding until we ENTER a pick phase.
+            while (
+                not self._is_pick_phase(self._simple_phase(self.env_runner))
+                and n_steps < self.max_steps
+            ):
+                subgoal = self._oracle_subgoal()
+                actions = self._infer_actions(
+                    img, wrist, robot_state, task_goal, subgoal=subgoal,
+                    image_buf=image_buf, state_buf=state_buf, exec_start_idx=exec_start_idx,
+                )
+                img, wrist, robot_state, n_steps, stop, success_flag, dead = self._stream_apply(
+                    actions, image_buf, wrist_buf, state_buf, captured, captured_steps, n_steps,
+                    recorder=recorder, subgoal=subgoal,
+                )
+                if dead:
+                    yield self._finalize("error", image_buf[-1], n_steps)
+                    return
+                _push(self._simple_phase(self.env_runner))
+                if stop:
+                    break
+            if not self._is_pick_phase(self._simple_phase(self.env_runner)):
+                # Episode ended (stop) or ran out of budget before another pick — no
+                # more decisions. Yield the outcome so the trainer scores the episode.
+                if n_steps >= self.max_steps and success_flag in ("unknown", ""):
+                    success_flag = "timeout"
+                yield self._finalize(success_flag, img, n_steps)
+                return
+
+            # 2. At a pick decision point — hand the VLM the buffer + broad window.
+            recent_frames, recent_steps = self._stream_window(captured, captured_steps, window_start)
+            dp = DecisionPoint(
+                key_frames=buffer.frames(),
+                recent_frames=[img] if no_fifo else recent_frames,
+                task_goal=task_goal,
+                history_subgoals=self._history_before_pick(phase_seq),
+                candidate_frames=recent_frames,
+                current_frame=img,
+                warm_steps=n_steps,
+                terminated_early=False,
+                success_flag=success_flag,
+            )
+            sent = yield dp
+            subtask_qwen, kf_positions = sent if sent is not None else ("", [])
+
+            # 3. Merge nominated keyframes into the buffer.
+            # buffer_reset: clear before merging so each pick uses ONLY its own nominations
+            # (tests whether cross-pick buffer persistence is necessary).
+            if buffer_reset:
+                buffer = KeyframeBuffer(dist=self.keyframe_cluster_dist, cap=self.keyframe_buffer_cap)
+            # Always validate against the full candidate window (recent_frames), not the
+            # potentially truncated no_fifo=[img] view, so positions reference the same pool.
+            kept_pos = valid_keyframe_positions(kf_positions, len(recent_frames), self.max_keyframes)
+            buffer.merge([TaggedFrame(recent_frames[p - 1], recent_steps[p - 1]) for p in kept_pos])
+
+            # 4. Execute the VLM subtask until this pick completes / fails / budget.
+            subtask = from_qwen_xy(subtask_qwen)   # SINGLE VLM→executor conversion point
+            if not subtask.strip():
+                # Blank pick — π0.5 with no subgoal can't advance; score where we are.
+                yield self._finalize(success_flag, img, n_steps)
+                return
+            pick_deadline = n_steps + per_pick_cap
+            stop = False
+            while (
+                self._is_pick_phase(self._simple_phase(self.env_runner))
+                and n_steps < pick_deadline
+                and n_steps < self.max_steps
+            ):
+                actions = self._infer_actions(
+                    img, wrist, robot_state, task_goal, subgoal=subtask,
+                    image_buf=image_buf, state_buf=state_buf, exec_start_idx=exec_start_idx,
+                )
+                img, wrist, robot_state, n_steps, stop, success_flag, dead = self._stream_apply(
+                    actions, image_buf, wrist_buf, state_buf, captured, captured_steps, n_steps,
+                    recorder=recorder, subgoal=subtask,
+                )
+                if dead:
+                    yield self._finalize("error", image_buf[-1], n_steps)
+                    return
+                _push(self._simple_phase(self.env_runner))
+                if stop:
+                    break
+            picks_done += 1
+            window_start = len(captured) - 1   # next pick grounds only on post-this-pick frames + buffer
+            if stop or n_steps >= self.max_steps:
+                if n_steps >= self.max_steps and success_flag in ("unknown", ""):
+                    success_flag = "timeout"
+                yield self._finalize(success_flag, img, n_steps)
+                return
+
+        yield self._finalize(success_flag, img, n_steps)
+
     def rollout_oracle(
-        self, episode_id: int, seed: Optional[int] = None, log_every: int = 0
+        self, episode_id: int, seed: Optional[int] = None, log_every: int = 0, recorder=None
     ) -> RolloutResult:
         """GroundSG + ONLINE-ORACLE upper bound — drive the WHOLE episode with the
         per-chunk oracle subgoal (re-queried each inference, as MemER's high-level
@@ -409,6 +839,8 @@ class RolloutWorker:
                 image_buf.append(img)
                 wrist_buf.append(wrist)
                 state_buf.append(robot_state)
+                if recorder is not None:
+                    recorder.record(img, wrist, robot_state, subgoal=subgoal)
                 if stop or n_steps >= self.max_steps:
                     break
             if stop or n_steps >= self.max_steps:
@@ -555,4 +987,4 @@ class RolloutWorker:
         return self.client.infer(element)["actions"][: self.obs_horizon]
 
 
-__all__ = ["RolloutWorker", "RolloutResult", "DecisionPoint"]
+__all__ = ["RolloutWorker", "RolloutResult", "DecisionPoint", "Snapshot"]

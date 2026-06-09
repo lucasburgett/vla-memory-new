@@ -1,0 +1,312 @@
+% Gemini theme
+% See: https://rev.cs.uchicago.edu/k4rtik/gemini-uccs
+% A fork of https://github.com/anishathalye/gemini
+
+\documentclass[final]{beamer}
+
+% ====================
+% Packages
+% ====================
+\usepackage{multicol}
+\usepackage[sfdefault]{raleway}
+\usepackage{natbib}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[size=custom,width=120,height=72,scale=1.0]{beamerposter}
+\usetheme{gemini}
+% \usecolortheme{uchicago}
+\usecolortheme{stanford}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+
+% ====================
+% Lengths
+% ====================
+
+\newlength{\sepwidth}
+\newlength{\colwidth}
+\setlength{\sepwidth}{0.025\paperwidth}
+\setlength{\colwidth}{0.3\paperwidth}
+
+\newcommand{\separatorcolumn}{\begin{column}{\sepwidth}\end{column}}
+
+\title{Memory-Augmented VLM Planners for Long-Horizon VLA Control via RL}
+
+\author{Krish Sharma \inst{1} \and Lucas Burgett \inst{1}}
+
+\institute[shortinst]{\inst{1} Department of Computer Science, Stanford University \quad Advisor: Marcel Torne}
+
+% ====================
+% Footer (optional)
+% ====================
+
+\footercontent{
+  \hfill
+  CS 224R --- Deep Reinforcement Learning \hfill
+}
+
+% ====================
+% Logo (optional)
+% ====================
+
+% \logoright{\includegraphics[height=7cm]{stanford_logos/Block_S_2_color.png}}
+
+% ====================
+% Body
+% ====================
+
+\begin{document}
+
+\addtobeamertemplate{headline}{}
+{
+    \begin{tikzpicture}[remember picture,overlay]
+      \node [anchor=north east, inner sep=3cm] at ([xshift=0.0cm,yshift=2.5cm]current page.north east)
+      {\includegraphics[height=7.0cm]{stanford_logos/Block_S_2_color.png}};
+    \end{tikzpicture}
+}
+
+\begin{frame}[t]
+\begin{columns}[t]
+\separatorcolumn
+
+% ====================
+% COLUMN 1
+% ====================
+\begin{column}{\colwidth}
+
+  \begin{block}{Introduction \& Problem}
+
+    Long-horizon robot manipulation requires two distinct capabilities: \textbf{motor skill} (how to execute an action) and \textbf{episodic memory} (what happened earlier in the episode). State-of-the-art Vision-Language-Action (VLA) models like $\pi_{0.5}$ handle the former well but lack the latter entirely.
+
+    \vspace{0.5em}
+    When tasks require recalling \textit{pre-occlusion state} --- such as which bin hid which colored cube before it was covered --- purely reactive policies fail catastrophically, even though the required motor primitives are identical to simpler variants.
+
+    \vspace{0.5em}
+    \textbf{Why hasn't this been solved?} Prior work (MemER~\cite{memer}, MEM~\cite{mem}) addresses memory via \textit{imitation learning} on ${\sim}50$ demonstrations per task. We ask: can \textbf{reinforcement learning} do better, and which RL algorithm best preserves the structured output format required for grounded manipulation?
+
+    \begin{itemize}
+      \item Replay buffers grow unboundedly over long episodes.
+      \item VLMs fine-tuned with sparse rewards risk \textit{format collapse} --- abandoning structured outputs for degenerate fixed responses.
+      \item No large-scale demonstration datasets exist for memory-demanding manipulation tasks.
+    \end{itemize}
+
+    \vspace{0.5em}
+    We propose a \textbf{hierarchical memory-augmented planner} above a frozen $\pi_{0.5}$ action expert. A Qwen3-VL-4B VLM maintains a keyframe memory buffer and emits grounded language subgoals, fine-tuned via a \textbf{quick algorithmic survey} of GRPO, RLOO, and PPO (with and without KL regularization) on dense task-completion reward.
+
+  \end{block}
+
+  \begin{block}{Benchmark: RoboMME}
+
+    We evaluate on \textbf{RoboMME}~\cite{robomme}, a suite of 16 ManiSkill tasks organized into four memory-demand categories:
+
+    \begin{itemize}
+      \item \textbf{Counting} --- repeat actions a specified number of times (e.g., \textit{PickXtimes}, \textit{SwingXtimes}).
+      \item \textbf{Persistent} --- recall and act on object state that has since been occluded (e.g., \textit{ButtonUnmask}, \textit{ButtonUnmaskSwap}).
+      \item \textbf{Referential} --- resolve pronoun references to earlier-seen objects (e.g., \textit{VideoRepick}, \textit{VideoPlaceButton}).
+      \item \textbf{Behavior} --- imitate a demonstrated behavior pattern (e.g., \textit{MoveCube}, \textit{PatternLock}).
+    \end{itemize}
+
+    \vspace{0.5em}
+    RoboMME cleanly separates memory demand from motor difficulty: \textit{swap} and \textit{repick} variants use \textbf{identical motor primitives} to their base versions but require remembering pre-occlusion state. Success-rate differences are directly attributable to memory.
+
+    \vspace{1em}
+    \begin{figure}[t]
+      \centering
+      \fbox{\parbox{0.9\linewidth}{\centering \vspace{3cm} \textbf{[Figure: Frozen $\pi_{0.5}$ per-task success on RoboMME]} \\ Bar chart grouped by memory category. \\ Dashed line = 19.2\% mean. \vspace{3cm}}}
+      \caption{Frozen $\pi_{0.5}$ baseline on RoboMME (50 ep/task, seed 7). Swap and repick variants collapse relative to base versions, isolating memory as the bottleneck.}
+    \end{figure}
+
+  \end{block}
+
+\end{column}
+
+\separatorcolumn
+
+% ====================
+% COLUMN 2
+% ====================
+\begin{column}{\colwidth}
+
+  \begin{block}{Approach}
+
+    \textbf{Architecture.} Our system is a two-level hierarchy:
+
+    \begin{enumerate}
+      \item \textbf{High-Level Planner (Qwen3-VL-4B + LoRA):} Receives the task instruction, a sliding window of recent frames, and a \textit{reveal-window keyframe buffer} (the memory tier). At each decision point it emits a grounded language subgoal with pixel coordinates.
+      \item \textbf{Low-Level Actor ($\pi_{0.5}$, frozen):} Receives the current subgoal and raw observations; outputs continuous actions via its JAX/Flax diffusion policy.
+    \end{enumerate}
+
+    \vspace{0.5em}
+    \textbf{Two-Tier Memory.}
+    \begin{itemize}
+      \item \textit{FIFO Frame Window}: last $N$ RGB frames, providing recent context.
+      \item \textit{Keyframe Buffer}: heuristic reveal-window frames capturing pre-occlusion scene state (which bin hides which cube). Lucas's full GRPO branch extends this to \textit{learned} keyframe selection trained jointly with the subtask head.
+    \end{itemize}
+
+    \vspace{1em}
+    \begin{figure}[t]
+      \centering
+      \begin{tikzpicture}[
+        node distance=4.2cm,
+        every node/.style={draw, rounded corners, align=center, minimum height=1.8cm, text width=3.8cm},
+        arrow/.style={->, thick}
+      ]
+        \node (obs)    {\textbf{Observations}\\ RGB + task str.};
+        \node (mem)    [right of=obs]   {\textbf{Memory}\\ FIFO + Keyframes};
+        \node (qwen)   [right of=mem]   {\textbf{Qwen3-VL-4B}\\ Planner (LoRA)};
+        \node (pi0)    [right of=qwen]  {\textbf{$\pi_{0.5}$}\\ Actor (frozen)};
+        \draw[arrow] (obs)  -- (mem);
+        \draw[arrow] (mem)  -- (qwen);
+        \draw[arrow] (qwen) -- node[draw=none,above,text width=2cm,font=\small]{subgoal\\ \texttt{<x,y>}} (pi0);
+        \draw[arrow] (obs.south) .. controls +(0,-1.5) and +(0,-1.5) .. (pi0.south);
+      \end{tikzpicture}
+      \caption{Hierarchical architecture. The planner maintains memory and communicates grounded subgoals (pixel coordinates in Qwen-VL space 0--1000) to the frozen actor.}
+    \end{figure}
+
+    \vspace{0.5em}
+    \textbf{RL Survey: GRPO, RLOO, and PPO.}
+    We compare four policy-gradient conditions for fine-tuning the planner, all from the same SFT warm-start:
+
+    \begin{itemize}
+      \item \textbf{GRPO}~\cite{grpo_2024}: samples $G{=}4$ rollouts per prompt, uses group-relative advantage $\hat{A}_k = r_k - \bar{r}$, no value network.
+      \item \textbf{RLOO}: leave-one-out baseline $\hat{A}_k = r_k - \tfrac{\sum_{j \neq k} r_j}{K-1}$; unbiased, no value network, no grouping overhead.
+      \item \textbf{PPO ($\beta{=}0$)}: scalar value head $V(s)$ trained alongside LoRA; advantage $\hat{A}_k = r_k - V(s).\texttt{detach}()$. Contextual-bandit variant (no GAE, single on-policy update). No KL anchor.
+      \item \textbf{PPO ($\beta{=}0.1$)}: same as above with quadratic KL penalty to SFT reference, preventing the policy from drifting too far from the grounded output format.
+    \end{itemize}
+
+    All conditions use \textbf{LoRA} adapters on Qwen3-VL-4B, HuggingFace \texttt{generate()} with $K$ parallel sequences, and a \textbf{dense task-completion fraction} $r \in [0,1]$ from ManiSkill's sequential-task tracker as the reward signal (not binary success).
+
+    \vspace{0.5em}
+    \textbf{Infrastructure.} JAX/Flax $\pi_{0.5}$ policy server and ManiSkill (CPU/OSMesa rendering) co-located in one Modal A100-80GB container, communicating over a localhost WebSocket. SFT warm-start (5 epochs, lr $4 \times 10^{-6}$) precedes all RL conditions.
+
+  \end{block}
+
+  \begin{block}{Published Baseline Results (RoboMME, Dai et al.\ 2026)}
+
+    Numbers below are from Table~3 of the RoboMME benchmark paper~\cite{robomme} (50 ep/task).
+    Motor skill is \textit{not} the bottleneck --- memory is:
+
+    \vspace{0.5em}
+    \begin{center}
+    \small
+    \begin{tabular}{lccc}
+      \toprule
+      \textbf{Method} & \textbf{ButtonUnmask} & \textbf{BtnUnmaskSwap} & \textbf{Overall} \\
+      \midrule
+      Frozen $\pi_{0.5}$ (no memory) & 22.2\% & 6.7\%  & 17.9\% \\
+      MemER~\cite{memer} (IL on demos)        & 72.0\% & 21.3\% & 42.4\% \\
+      GroundSG + Oracle (ceiling)    & 95.0\% & 80.2\% & 84.1\% \\
+      \midrule
+      Human                          & \multicolumn{2}{c}{---} & 90.5\% \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+    \vspace{0.3em}
+    \footnotesize{MemER trains its VLM planner with supervised IL on ${\sim}$50 human-annotated demonstrations per task.
+    Our goal: match or exceed MemER using RL on task-success reward \textit{alone} --- no human demos.
+    GroundSG + Oracle gives the ceiling assuming a perfect memory module.}
+
+  \end{block}
+
+\end{column}
+
+\separatorcolumn
+
+% ====================
+% COLUMN 3
+% ====================
+\begin{column}{\colwidth}
+
+  \begin{block}{Experimental Results}
+
+    \textbf{RL algorithmic survey} on ButtonUnmask val (50 ep, seed 0).
+    All RL conditions fine-tune from the same SFT checkpoint.
+
+    \begin{center}
+    \small
+    \begin{tabular}{lcc}
+      \toprule
+      \textbf{Method} & \textbf{Mean Reward$^\dagger$} & \textbf{Subgoal Format} \\
+      \midrule
+      Zero-shot Qwen3-VL-4B           & 0.30 & Simple, no coords \\
+      + SFT warm-start (IL only)      & 0.30 & Grounded $\langle x,y\rangle$ $\checkmark$ \\
+      + PPO, $\beta_\text{KL}{=}0$    & 0.27 & \textbf{Collapsed} $\times$ \\
+      + PPO, $\beta_\text{KL}{=}0.1$  & 0.28 & Grounded $\langle x,y\rangle$ $\checkmark$ \\
+      + GRPO / RLOO (any $K$)          & 0.30 & Grounded — 0 grad steps$^*$ \\
+      \midrule
+      \textit{Target:} MemER~\cite{memer} & \textit{---} & \textit{72\% SR on ButtonUnmask} \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+    \vspace{0.3em}
+    \footnotesize{$^\dagger$Dense task-completion fraction $r\!\in\![0,1]$; not directly comparable to MemER success rate.\\
+    $^*$Coordinate space mismatch causes constant subgoal output --- see below.}
+
+    \vspace{0.8em}
+    \textbf{Key finding 1 — Format collapse.}
+    PPO without KL ($\beta{=}0$) abandons the grounded $\langle x,y\rangle$ format entirely, outputting a fixed phrase regardless of scene. KL anchoring ($\beta{=}0.1$) preserves format.
+
+    \vspace{0.4em}
+    \textbf{Key finding 2 — Coordinate space bottleneck.}
+    All methods plateau at mean reward ${\approx}0.30$ --- identical to zero-shot. Root cause: SFT targets used raw pixel coordinates ($\langle y,x\rangle$, 0--256) while Qwen3-VL grounds natively in normalized space ($\langle x,y\rangle$, 0--1000). The model learned a constant near-center coordinate regardless of scene, eliminating reward variance and making group-based RL (GRPO, RLOO) degenerate (zero gradient steps at any $K$). Lucas's \texttt{to\_qwen\_xy}/\texttt{from\_qwen\_xy} fix addresses this directly.
+
+  \end{block}
+
+  \begin{block}{Ablations}
+
+    To isolate each component's contribution:
+
+    \begin{enumerate}
+      \item \textbf{SFT only} --- IL warm-start, no RL (replicates MemER/MEM~\cite{memer,mem}).
+      \item \textbf{GRPO} --- group-relative baseline, $G{=}4$, $\beta{=}0$.
+      \item \textbf{RLOO} --- leave-one-out baseline, same $K$ rollouts as GRPO, no value head.
+      \item \textbf{PPO $\beta{=}0$} --- learned value baseline, no KL anchor.
+      \item \textbf{PPO $\beta{=}0.1$} --- value baseline + KL constraint to SFT reference.
+    \end{enumerate}
+
+    \vspace{0.5em}
+    All five conditions share SFT checkpoint, task (ButtonUnmask), rollout budget ($K{=}4$, max 100 steps), and training steps (25). This controls for compute and isolates the algorithmic variable.
+
+    \vspace{0.5em}
+    \textbf{Lucas's full GRPO contribution} (in progress): streaming memory across multiple picks per episode, jointly trained keyframe selection, ButtonUnmaskSwap (harder Permanence variant), and corrected Qwen-VL coordinate space ($\langle x,y \rangle$ 0--1000). This constitutes the primary research claim of the paper.
+
+  \end{block}
+
+  \begin{block}{Conclusions, Limitations \& Future Work}
+
+    \textbf{Conclusions.} We present a hierarchical memory-augmented VLA and identify two failure modes blocking RL-based memory training: (1) \textbf{format collapse} --- RL without KL regularization destroys the grounded coordinate output format; (2) \textbf{coordinate space mismatch} --- SFT in the wrong pixel space collapses subgoal diversity, making group-based RL (GRPO, RLOO) degenerate. Together these explain why our RL survey plateaus at the same level as zero-shot Qwen (mean reward 0.30), far below MemER-IL (72\% on ButtonUnmask). Lucas's coordinate fix and streaming GRPO are the proposed solutions.
+
+    \vspace{0.5em}
+    \textbf{Limitations.}
+    \begin{itemize}
+      \item \textbf{Format collapse under RL}: PPO without KL destroys the grounded coordinate format. Mitigation: KL anchoring; or lower learning rate during RL phase.
+      \item \textbf{Short training budget}: 25-step survey is sufficient for algorithmic comparison but insufficient for convergence. Full-scale runs require 200+ steps (${\sim}$17 hours on A100 at current rollout speed).
+      \item \textbf{Rollout bottleneck}: ManiSkill CPU rendering dominates wall time (${\sim}5$ min/step). GPU rendering or parallelized environments would accelerate training significantly.
+      \item Binary reward is sparse for the hardest tasks; mitigation: ManiSkill progress shaping or a base-to-swap curriculum.
+    \end{itemize}
+
+    \vspace{0.5em}
+    \textbf{Future Work.} Full-scale GRPO with streaming keyframe selection on ButtonUnmaskSwap; extend to multi-object tracking tasks; GPU-accelerated rollout environments; generalization to out-of-distribution RoboCasa environments.
+
+    \vspace{0.5em}
+    \textbf{Takeaway.} Hierarchical decomposition --- separating \textit{what to do} (VLM planner with memory) from \textit{how to do it} (frozen VLA actor) --- is a tractable path to long-horizon manipulation. However, RL fine-tuning of the planner requires careful regularization to preserve structured grounded outputs.
+
+  \end{block}
+
+  \begin{block}{References}
+    \tiny
+    \nocite{pi05_2024, qwen3vl, grpo_2024, ppo_schulman, robomme, maniskill, memer, mem}
+    \bibliographystyle{plain}
+    \bibliography{poster}
+  \end{block}
+
+\end{column}
+
+\separatorcolumn
+\end{columns}
+\end{frame}
+
+\end{document}

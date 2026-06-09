@@ -34,12 +34,25 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shutil
 from typing import List, Optional, Tuple
 
 import numpy as np
 
-from vla_memory.qwen_subgoal.prompts import SUBGOAL_SYSTEM_PROMPT, build_user_prompt
+# Strips the copyable "that hides the {colour} cube" suffix off the grounded pick
+# subgoal so the COORDINATE is the only variable token span in the SFT target.
+_HIDES_SUFFIX = re.compile(r"\s+that hides the .*$", re.IGNORECASE)
+
+# Pixel <y,x> 0–256 → Qwen-native <x,y> 0–1000. The pair (with from_qwen_xy, used
+# at inference in rollout) lives in qwen_subgoal.coords so the build-time target
+# and the inference round-trip share one source of truth.
+from vla_memory.qwen_subgoal.coords import to_qwen_xy as _to_qwen_xy
+from vla_memory.qwen_subgoal.prompts import (
+    SELECT_SYSTEM_PROMPT,
+    SUBGOAL_SYSTEM_PROMPT,
+    build_user_prompt,
+)
 
 
 class MemorySFTBuilder:
@@ -58,6 +71,8 @@ class MemorySFTBuilder:
         n_candidate_frames: int = 12,
         max_keyframes: int = 4,
         also_select: bool = True,
+        streaming: bool = False,
+        keyframe_buffer_cap: int = 8,
         seed: int = 0,
         max_episodes: Optional[int] = None,
     ) -> None:
@@ -69,7 +84,12 @@ class MemorySFTBuilder:
         self.augment_factor = max(1, augment_factor)
         self.n_candidate_frames = n_candidate_frames
         self.max_keyframes = max_keyframes
-        self.also_select = also_select   # also emit SELECT rows for the joint pipeline
+        # streaming = MemER-faithful SINGLE-call rows ({current_subtask, keyframe_positions}
+        # BOTH populated), with the keyframe buffer carried across picks. Supersedes the
+        # two-call SELECT/USE rows; when set, also_select is ignored (no separate SELECT row).
+        self.streaming = streaming
+        self.keyframe_buffer_cap = keyframe_buffer_cap
+        self.also_select = also_select and not streaming
         self.max_episodes = max_episodes
         self._rng = random.Random(seed)
 
@@ -144,34 +164,21 @@ class MemorySFTBuilder:
         if len(captured) < 2:
             return 0
 
-        # Decision point: first frame where the online subgoal leaves the initial
-        # (press) phase — the post-occlusion memory choice. Mirrors rollout._warmup.
-        phase0 = simple_online(captured[0])
-        decision_ts = None
+        # All PICK decision points. A multi-pick task (ButtonUnmaskSwap picks blue THEN
+        # green) has several; each is its own memory decision + SFT row-set so joint GRPO
+        # earns reward on every pick. Detect the START of each distinct "pick up the
+        # container ..." phase (single-pick tasks yield exactly one).
+        pick_starts: List[int] = []
+        prev = None
         for ts in captured:
-            if simple_online(ts) != phase0:
-                decision_ts = ts
-                break
-        if decision_ts is None:
+            s = simple_online(ts)
+            if "pick up the container" in s and s != prev:
+                pick_starts.append(ts)
+            prev = s
+        if not pick_starts:
             return 0
 
-        from vla_memory.qwen_subgoal.coords import to_qwen_xy
-        grounded = to_qwen_xy(
-            episode_data[f"timestep_{decision_ts}"]["info"]["grounded_subgoal_online"][()]
-            .decode()
-            .strip()
-        )
-        if not grounded:
-            return 0
-
-        window = [ts for ts in captured if ts <= decision_ts]
-        n = len(window)
-        reveal_end = min(self.reveal_window, n - 1)
-        recent_ts = window[max(0, n - self.n_recent_frames):]
-        if not recent_ts:
-            return 0
-
-        # Cache so a frame reused across augmentations is written once.
+        # Frame cache shared across picks + augmentations (each frame written once).
         saved: dict = {}
 
         def save(ts: int) -> str:
@@ -179,56 +186,245 @@ class MemorySFTBuilder:
                 saved[ts] = self._save_frame(episode_data, env_id, episode_idx, ts)
             return saved[ts]
 
+        if self.streaming:
+            return self._emit_episode_streaming(
+                episode_data, task_goal, captured, pick_starts, simple_online, save
+            )
+
+        n_rows = 0
+        for decision_ts in pick_starts:
+            n_rows += self._emit_pick(
+                episode_data, task_goal, captured, decision_ts, simple_online, save
+            )
+        return n_rows
+
+    def _emit_episode_streaming(
+        self,
+        episode_data,
+        task_goal: str,
+        captured: List[int],
+        pick_starts: List[int],
+        simple_online,
+        save,
+    ) -> int:
+        """Emit the MemER single-call STREAMING rows for one episode.
+
+        One row per (pick, augment): a single MemER call with key_frames = the keyframe
+        buffer the streaming rollout would hold at that pick (empty at pick 0; the prior
+        picks' nominations after, accumulated + capped) and recent_frames = this pick's
+        broad window. Target = ``{current_subtask, keyframe_positions}`` with BOTH fields
+        populated. The buffer is threaded across picks so SFT mirrors the streaming
+        rollout (rollout.rollout_streaming): pick 0's window spans reveal→swaps so its
+        nominations capture the memory; pick i>0's window is occluded so grounding must
+        come from the buffer. Mirrors trainer._streaming_group's prompt structure (parity).
+        """
+        # Split captured into per-pick windows at the pick boundaries: pick 0 spans
+        # reveal→pick0 (cube-visible); pick i>0 spans (pick(i-1)_start, pick_i] (occluded),
+        # matching the streaming rollout's window_start advancing past each completed pick.
+        windows: List[List[int]] = []
+        prev = None
+        for ds in pick_starts:
+            if prev is None:
+                windows.append([ts for ts in captured if ts <= ds])
+            else:
+                windows.append([ts for ts in captured if prev < ts <= ds])
+            prev = ds
+
+        n_rows = 0
+        buffer_paths: List[str] = []   # the keyframe buffer the rollout holds at this pick
+        for decision_ts, window in zip(pick_starts, windows):
+            if not window:
+                continue
+            # History = distinct completed subtasks before THIS pick (parity with
+            # rollout._history_before_pick); on Swap pick 1 it includes the completed pick 0.
+            history: List[str] = []
+            for ts in captured:
+                if ts >= decision_ts:
+                    break
+                sg = simple_online(ts)
+                if sg and sg not in history:
+                    history.append(sg)
+            written, next_buffer = self._emit_pick_streaming(
+                episode_data, task_goal, window, history, decision_ts, simple_online, save, buffer_paths
+            )
+            n_rows += written
+            # Accumulate the buffer across picks (MemER), capped — most-recent picks' frames.
+            buffer_paths = (buffer_paths + next_buffer)[-self.keyframe_buffer_cap:]
+        return n_rows
+
+    def _emit_pick_streaming(
+        self,
+        episode_data,
+        task_goal: str,
+        window: List[int],
+        history: List[str],
+        decision_ts: int,
+        simple_online,
+        save,
+        buffer_paths: List[str],
+    ) -> Tuple[int, List[str]]:
+        """Emit the streaming rows for ONE pick. Returns (n_written, next_buffer_paths)
+        where next_buffer_paths = the frames this pick nominates (a=0 even-spacing,
+        inference-matching), to carry into the next pick's buffer."""
+        grounded = (
+            episode_data[f"timestep_{decision_ts}"]["info"]["grounded_subgoal_online"][()]
+            .decode()
+            .strip()
+        )
+        if not grounded:
+            return 0, []
+        grounded = _HIDES_SUFFIX.sub("", grounded).strip()
+        grounded = _to_qwen_xy(grounded)   # <y,x> 0–255 px → Qwen-native <x,y> 0–1000
+
+        n = len(window)
+        important_ts = self._memer_important(episode_data, window, simple_online)
+
+        next_buffer: List[str] = []
+        n_written = 0
+        for a in range(self.augment_factor):
+            cand_pos = self._candidate_window(n, a)
+            cand_ts = [window[p] for p in cand_pos]
+            cand_paths = [save(ts) for ts in cand_ts]
+            sel_label = self._memer_label(cand_ts, important_ts)
+            user = build_user_prompt(
+                task_goal=task_goal,
+                n_key_frames=len(buffer_paths),
+                n_recent_frames=len(cand_paths),
+                history_subgoals=history,
+                has_video_demo=False,
+            )
+            # The MemER single-call target: BOTH current_subtask AND keyframe_positions.
+            assistant = json.dumps({"current_subtask": grounded, "keyframe_positions": sel_label})
+            self._write_row(user, assistant, buffer_paths + cand_paths)
+            n_written += 1
+            if a == 0:
+                next_buffer = [cand_paths[p - 1] for p in sel_label]
+        return n_written, next_buffer
+
+    def _emit_pick(
+        self,
+        episode_data,
+        task_goal: str,
+        captured: List[int],
+        decision_ts: int,
+        simple_online,
+        save,
+    ) -> int:
+        """Emit the USE (+ SELECT, if joint) rows for ONE pick at ``decision_ts``.
+
+        The oracle drives earlier picks at rollout time, so each pick is an independent
+        memory decision — its own keyframes, grounded target, and completed history.
+        """
+        # History = distinct completed subtasks before THIS pick (presses + earlier
+        # picks + put-downs). On Swap pick 2 this INCLUDES the completed pick 1 → the
+        # prompt tells the model which colour it's now on. MUST match
+        # rollout._history_before_pick for prompt parity.
+        history: List[str] = []
+        for ts in captured:
+            if ts >= decision_ts:
+                break
+            sg = simple_online(ts)
+            if sg and sg not in history:
+                history.append(sg)
+
+        grounded = (
+            episode_data[f"timestep_{decision_ts}"]["info"]["grounded_subgoal_online"][()]
+            .decode()
+            .strip()
+        )
+        if not grounded:
+            return 0
+        # Coordinate-focused target: drop "that hides the {colour} cube" so the
+        # coordinate (the memory output) is the dominant, only-variable span; colour
+        # stays in the PROMPT. GroundSG is coordinate-driven (probe: colour-insensitive).
+        grounded = _HIDES_SUFFIX.sub("", grounded).strip()
+        grounded = _to_qwen_xy(grounded)   # <y,x> 0–255 px → Qwen-native <x,y> 0–1000
+
+        window = [ts for ts in captured if ts <= decision_ts]
+        n = len(window)
+        reveal_end = min(self.reveal_window, n - 1)
+        recent_ts = window[max(0, n - self.n_recent_frames):]
+        if not recent_ts:
+            return 0
         recent_paths = [save(ts) for ts in recent_ts]
+
+        # Memer-style "important" timesteps over THIS pick's pre-decision window:
+        # subgoal transitions + action-velocity minima. On Swap the transitions align
+        # with the container swaps, so the kept frames span reveal→swaps (what the USE
+        # call needs to deduce the post-swap container position).
+        important_ts = self._memer_important(episode_data, window, simple_online)
 
         n_written = 0
         for a in range(self.augment_factor):
-            key_pos = self._key_positions(reveal_end, a)
-            key_ts = [window[p] for p in key_pos]
-            key_paths = [save(ts) for ts in key_ts]
+            if self.also_select:
+                # JOINT: the USE call must train on the SAME frames a correct SELECT
+                # keeps — at GRPO the USE call receives apply_selection's output, NOT a
+                # reveal-window slice. So build the candidate window + memer SELECT label
+                # first, then point the USE keyframes at the selected candidates. This
+                # keeps SFT-USE ≡ GRPO-USE (the kept frames) and, on Swap, trains the
+                # USE head on the swap-tracking frames it will actually receive.
+                cand_pos = self._candidate_window(n, a)
+                cand_ts = [window[p] for p in cand_pos]
+                cand_paths = [save(ts) for ts in cand_ts]
+                sel_label = self._memer_label(cand_ts, important_ts)
+                key_paths = [cand_paths[p - 1] for p in sel_label]
+            else:
+                # ONE-SHOT: reveal-window even-spacing — matches rollout._select_memory_frames
+                # and preserves the validated coordinate checkpoint's prompt (parity).
+                key_pos = self._key_positions(reveal_end, a)
+                key_paths = [save(window[p]) for p in key_pos]
 
             user = build_user_prompt(
                 task_goal=task_goal,
                 n_key_frames=len(key_paths),
                 n_recent_frames=len(recent_paths),
-                # The completed-subtask timing signal: phase0 is the pre-transition
-                # simple subgoal ("press the button"). Without it the model can't
-                # tell the press is done and collapses to a constant "press the
-                # button" output (the keyframes-only prompt's failure mode).
-                history_subgoals=[phase0],
+                # The completed-subtask timing signal (e.g. ["press the button"], or
+                # both presses on ButtonUnmaskSwap). Without it the model can't tell
+                # the press phase is done and collapses to a constant "press the
+                # button" output (the keyframes-only prompt's failure mode). Matches
+                # rollout.peek_at_decision_point's history (prompt parity).
+                history_subgoals=history,
                 has_video_demo=False,
             )
             assistant = json.dumps({"current_subtask": grounded, "keyframe_positions": []})
             self._write_row(user, assistant, key_paths + recent_paths)
             n_written += 1
 
-            # SELECT row (joint pipeline): given the broad candidate window, KEEP
-            # the reveal (cube-visible) frames. history=[] (the SELECT call is
-            # "observe & select"); current_subtask = the action shown (phase0).
-            # Parity with rollout._joint_group / _select_candidate_frames.
+            # SELECT row (joint pipeline): from the broad candidate window, KEEP the
+            # memer-important frames (transitions + action-velocity minima → spans
+            # reveal and, on Swap, the container swaps). DISTINCT schema from the USE
+            # row — SELECT_SYSTEM_PROMPT + mode="select" prompt + a target carrying
+            # ONLY keyframe_positions (no current_subtask). The two calls share near-
+            # identical images, so without distinct prompts the model collapsed
+            # keyframe_positions to the USE majority `[]` and the SELECT head learned
+            # nothing (project_sft_plan_adjustments). history=[] (observe & select);
+            # parity with trainer._joint_group's SELECT call (mode="select").
             if self.also_select:
-                cand_pos = self._candidate_window(n, a)
-                cand_ts = [window[p] for p in cand_pos]
-                cand_paths = [save(ts) for ts in cand_ts]
-                reveal_label = self._reveal_label(cand_ts, exec_start)
                 sel_user = build_user_prompt(
                     task_goal=task_goal,
                     n_key_frames=0,
                     n_recent_frames=len(cand_paths),
                     history_subgoals=[],
                     has_video_demo=False,
+                    mode="select",
                 )
-                sel_assistant = json.dumps(
-                    {"current_subtask": phase0, "keyframe_positions": reveal_label}
+                sel_assistant = json.dumps({"keyframe_positions": sel_label})
+                self._write_row(
+                    sel_user, sel_assistant, cand_paths, system=SELECT_SYSTEM_PROMPT
                 )
-                self._write_row(sel_user, sel_assistant, cand_paths)
                 n_written += 1
         return n_written
 
-    def _write_row(self, user: str, assistant: str, image_paths: List[str]) -> None:
+    def _write_row(
+        self,
+        user: str,
+        assistant: str,
+        image_paths: List[str],
+        system: str = SUBGOAL_SYSTEM_PROMPT,
+    ) -> None:
         row = {
             "messages": [
-                {"role": "system", "content": SUBGOAL_SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
                 {"role": "assistant", "content": assistant},
             ],
@@ -255,14 +451,51 @@ class MemorySFTBuilder:
                 out.append(int(p))
         return out
 
-    def _reveal_label(self, cand_ts: List[int], exec_start: int) -> List[int]:
-        """1-indexed candidate positions whose timestep is in the reveal window
-        (cube-visible) — the SELECT target — capped at ``max_keyframes``."""
-        reveal = [j + 1 for j, ts in enumerate(cand_ts) if (ts - exec_start) < self.reveal_window]
-        if len(reveal) > self.max_keyframes:
-            idx = np.linspace(0, len(reveal) - 1, num=self.max_keyframes, dtype=int)
-            reveal = [reveal[i] for i in idx]
-        return reveal
+    def _memer_important(self, episode_data, window: List[int], simple_online) -> List[int]:
+        """Memer-style 'important' timesteps over the pre-pick ``window``: subgoal
+        transitions + action-velocity minima (reuses the submodule's
+        ``find_local_minima``). RoboMME's own keyframe definition — task-agnostic, so
+        it generalizes from ButtonUnmask to Swap (the transitions line up with the
+        container swaps). Returns absolute timesteps; the start frame (reveal) is
+        always included."""
+        if not window:
+            return []
+        from mme_vla_suite.dataset_builder.build_vlm_subgoal_dataset_memer import (  # type: ignore
+            find_local_minima,
+        )
+
+        trans, prev = [], None
+        for ts in window:
+            s = simple_online(ts)
+            if prev is not None and s != prev:
+                trans.append(ts)
+            prev = s
+        try:
+            minima_pos = find_local_minima(episode_data, window)
+        except Exception as exc:  # missing joint_state/action keys, etc. — degrade gracefully
+            print(f"[memory-sft] find_local_minima failed ({exc!r}); transitions only", flush=True)
+            minima_pos = []
+        minima_ts = [window[i] for i in minima_pos if 0 <= i < len(window)]
+        return sorted(set([window[0]] + trans + minima_ts))
+
+    def _memer_label(self, cand_ts: List[int], important_ts: List[int]) -> List[int]:
+        """1-indexed candidate positions NEAREST the memer important timesteps — the
+        SELECT target, capped at ``max_keyframes``. Falls back to even spacing if no
+        important frames were found, so the SELECT head still gets a non-empty signal."""
+        if not cand_ts:
+            return []
+        if not important_ts:
+            k = min(self.max_keyframes, len(cand_ts))
+            return sorted({int(p) + 1 for p in np.linspace(0, len(cand_ts) - 1, num=k, dtype=int)})
+        labels = set()
+        for imp in important_ts:
+            j = min(range(len(cand_ts)), key=lambda k: abs(cand_ts[k] - imp))
+            labels.add(j + 1)
+        out = sorted(labels)
+        if len(out) > self.max_keyframes:
+            idx = np.linspace(0, len(out) - 1, num=self.max_keyframes, dtype=int)
+            out = [out[i] for i in idx]
+        return out
 
     # ------------------------------------------------------------------
     # Memory-frame selection
@@ -326,6 +559,8 @@ def build_memory_sft_dataset(
     n_candidate_frames: int = 12,
     max_keyframes: int = 4,
     also_select: bool = True,
+    streaming: bool = False,
+    keyframe_buffer_cap: int = 8,
     seed: int = 0,
     max_episodes: Optional[int] = None,
 ) -> dict:
@@ -341,6 +576,8 @@ def build_memory_sft_dataset(
         n_candidate_frames=n_candidate_frames,
         max_keyframes=max_keyframes,
         also_select=also_select,
+        streaming=streaming,
+        keyframe_buffer_cap=keyframe_buffer_cap,
         seed=seed,
         max_episodes=max_episodes,
     )

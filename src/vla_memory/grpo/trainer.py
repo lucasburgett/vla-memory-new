@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader
 
 from ..qwen_subgoal.model import QwenSubgoalPolicy, SampleResult
 from .reward import RewardConfig, compute_reward
-from .rollout import RolloutResult, RolloutWorker
+from .rollout import DecisionPoint, RolloutResult, RolloutWorker
 from .state_dataset import StateDataset, StateSample
 
 # A trajectory is the list of VLM generations scored by ONE episode reward:
@@ -52,7 +52,8 @@ class GRPOConfig:
     sample_temperature: float = 1.0
     sample_top_p: float = 0.95
     max_new_tokens: int = 128          # MemER target is a JSON object, not a bare phrase
-    rollout_max_steps: int = 200
+    rollout_max_steps: int = 700       # warm-up + forward exec budget; clears Swap pick 2's
+                                       # ~rel 410 warm-up (+pick). ButtonUnmask finishes well under.
     rollout_obs_horizon: int = 16
     subgoal_type: str = "simple_subgoal"
     use_history: bool = False
@@ -60,6 +61,21 @@ class GRPOConfig:
     joint_selection: bool = False          # select-then-use: SELECT call picks keyframes from the
                                            # candidate window, USE call acts on ONLY those. Trains
                                            # selection + subtask jointly. False = one-shot path.
+    streaming_memory: bool = False         # MemER-faithful: ONE call emits {current_subtask,
+                                           # keyframe_positions}; the VLM owns the whole episode and a
+                                           # keyframe buffer accumulates across pick decision points, so
+                                           # a selection at pick 0 causally drives pick 1's grounding.
+                                           # One state/episode; trajectory = the per-pick calls sharing
+                                           # the episode advantage. Mutually exclusive with the two above.
+    streaming_max_picks: int = 4           # cap on decision points per streaming episode.
+    streaming_buffer_reset: bool = False   # clear the keyframe buffer before each pick (vs accumulate).
+                                           # Tests whether cross-pick buffer persistence is necessary.
+    streaming_no_fifo: bool = False        # VLM sees only keyframe buffer + current frame, NOT the broad
+                                           # recent window. Tests whether the FIFO context is needed.
+    snapshot_branching: bool = False       # speed path: warm up ONCE per group, snapshot the env at
+                                           # the decision point, restore it per candidate (instead of
+                                           # re-warming K times). Off = rebuild path (the verified
+                                           # default). Gate with snapshot_parity_probe before enabling.
     n_candidate_frames: int = 12           # SELECT-call candidate window breadth
     max_keyframes: int = 4                 # cap on kept keyframes the USE call sees
     # --- advantage / loss shaping ---
@@ -303,44 +319,68 @@ class GRPOTrainer:
             group_seed = ((self.cfg.seed * 1_000_003 + state.episode_id) * 9_973 + step) % 2_147_483_647
 
         try:
-            # peek warms up with the oracle to the post-occlusion decision point and
-            # returns the reveal keyframes + recent context (+ the broad candidate
-            # window for joint selection). Each rollout below rebuilds the env from
-            # the same seed (cube layout matches) — see _ensure_env on why we rebuild.
-            dp = worker.peek_at_decision_point(state.episode_id, seed=group_seed)
-            if dp.terminated_early and self.cfg.debug_subgoals:
-                print(
-                    f"[grpo][debug] step={step} ep={state.episode_id} warm-up "
-                    f"terminated early ({dp.success_flag}) after {dp.warm_steps} "
-                    "steps — no memory decision; group should be degenerate.",
-                    flush=True,
-                )
-            if self.cfg.joint_selection:
-                trajectories, rewards = self._joint_group(dp, state, worker, group_seed, step)
+            if self.cfg.streaming_memory:
+                # Decision-point streaming: K full episodes (CRN seed), the policy driving
+                # one MemER call per pick with the keyframe buffer carried across picks.
+                # No peek/snapshot — each candidate's pick-0 choice changes the whole
+                # downstream episode, so there's nothing to branch from a single point.
+                trajectories, rewards = self._streaming_group(state, worker, group_seed, step)
             else:
-                trajectories, rewards = self._oneshot_group(dp, state, worker, group_seed, step)
+                # peek warms up with the oracle to the post-occlusion decision point and
+                # returns the reveal keyframes + recent context (+ the broad candidate
+                # window for joint selection). With snapshot_branching ON we ALSO capture
+                # a restorable env snapshot here so each candidate restores it instead of
+                # re-warming (see _ensure_env / rollout.peek_and_snapshot); OFF, each
+                # rollout rebuilds the env from the same seed (cube layout matches).
+                if self.cfg.snapshot_branching:
+                    dp, snapshot = worker.peek_and_snapshot(
+                        state.episode_id, seed=group_seed, pick_index=state.pick_index
+                    )
+                else:
+                    dp = worker.peek_at_decision_point(
+                        state.episode_id, seed=group_seed, pick_index=state.pick_index
+                    )
+                    snapshot = None
+                if dp.terminated_early and self.cfg.debug_subgoals:
+                    print(
+                        f"[grpo][debug] step={step} ep={state.episode_id} warm-up "
+                        f"terminated early ({dp.success_flag}) after {dp.warm_steps} "
+                        "steps — no memory decision; group should be degenerate.",
+                        flush=True,
+                    )
+                if self.cfg.joint_selection:
+                    trajectories, rewards = self._joint_group(dp, state, worker, group_seed, step, snapshot)
+                else:
+                    trajectories, rewards = self._oneshot_group(dp, state, worker, group_seed, step, snapshot)
         finally:
             worker.close()
         return trajectories, rewards, None
 
-    def _score_rollout(self, subtask: str, state: StateSample, worker, group_seed) -> float:
+    def _score_rollout(self, subtask: str, state: StateSample, worker, group_seed, snapshot=None) -> float:
         """Execute ``subtask`` on the low-level policy → dense reward.
 
         Blank subtask → 0 without a rollout (π0.5 with no subgoal can't do better;
         the negative advantage still trains the policy away from it). Averages
-        ``rollouts_per_subgoal`` trials to cut π0.5 flow-sampling noise.
+        ``rollouts_per_subgoal`` trials to cut π0.5 flow-sampling noise. With a
+        ``snapshot``, each trial restores the decision-point env (no re-warm); π0.5
+        flow-sampling is still stochastic per trial, so the averaging stays
+        meaningful and now isolates execution noise from warm-up noise.
         """
         if not subtask.strip():
             return 0.0
         trials: List[float] = []
         for _ in range(max(1, self.cfg.rollouts_per_subgoal)):
-            result = worker.rollout(
-                episode_id=state.episode_id, sampled_subgoal=subtask, seed=group_seed,
-            )
+            if snapshot is not None:
+                result = worker.rollout_from_snapshot(snapshot, subtask)
+            else:
+                result = worker.rollout(
+                    episode_id=state.episode_id, sampled_subgoal=subtask, seed=group_seed,
+                    pick_index=state.pick_index,
+                )
             trials.append(compute_reward(result.success_flag, result.progress, self.reward_cfg))
         return float(np.mean(trials))
 
-    def _oneshot_group(self, dp, state, worker, group_seed, step) -> tuple[List[Trajectory], List[float]]:
+    def _oneshot_group(self, dp, state, worker, group_seed, step, snapshot=None) -> tuple[List[Trajectory], List[float]]:
         """One VLM call → subtask; each candidate is its own length-1 trajectory."""
         cands = self.policy.sample_subgoals(
             key_frames=dp.key_frames,
@@ -361,10 +401,10 @@ class GRPOTrainer:
                     f"ntok={c.token_ids.numel()} subtask={c.subtask!r} kf={c.keyframe_positions}",
                     flush=True,
                 )
-        rewards = [self._score_rollout(c.subtask, state, worker, group_seed) for c in cands]
+        rewards = [self._score_rollout(c.subtask, state, worker, group_seed, snapshot=snapshot) for c in cands]
         return [[c] for c in cands], rewards
 
-    def _joint_group(self, dp, state, worker, group_seed, step) -> tuple[List[Trajectory], List[float]]:
+    def _joint_group(self, dp, state, worker, group_seed, step, snapshot=None) -> tuple[List[Trajectory], List[float]]:
         """SELECT call (pick keyframes from the candidate window) → USE call (act on
         ONLY the kept frames) → rollout. Trajectory = [selection, use]; both
         generations are trained by the episode reward, so selection + subtask are
@@ -383,6 +423,7 @@ class GRPOTrainer:
             top_p=self.cfg.sample_top_p,
             has_video_demo=state.has_video_demo,
             debug=self.cfg.debug_subgoals,
+            mode="select",   # distinct SELECT prompt/schema → emits keyframe_positions only
         )
         recent_base = [dp.current_frame] if dp.current_frame is not None else []
         trajectories: List[Trajectory] = []
@@ -413,8 +454,73 @@ class GRPOTrainer:
                     f"subtask={use.subtask!r}",
                     flush=True,
                 )
-            rewards.append(self._score_rollout(use.subtask, state, worker, group_seed))
+            rewards.append(self._score_rollout(use.subtask, state, worker, group_seed, snapshot=snapshot))
             trajectories.append([sel, use])
+        return trajectories, rewards
+
+    def _streaming_group(self, state, worker, group_seed, step) -> tuple[List[Trajectory], List[float]]:
+        """MemER-faithful decision-point streaming (JOINT/STREAMING design).
+
+        Runs ``group_size`` FULL episodes under the same env seed (CRN). Each episode
+        is driven by ``worker.rollout_streaming`` (a generator): at every pick the
+        policy makes ONE MemER call → ``{current_subtask, keyframe_positions}``; the
+        nominated frames accumulate into the worker's keyframe buffer, so what's kept at
+        pick 0 (window spans reveal+swaps) is the memory it grounds the now-occluded
+        pick 1 on. The trajectory is the per-pick generations; the episode reward
+        (group-relative) trains them jointly, putting a gradient on selection.
+
+        Why K full replays (not snapshot branching): each candidate's pick-0 choice
+        changes the whole downstream episode, so there is no single point to branch K
+        ways. The env is rebuilt per episode by ``rollout_streaming`` (``_ensure_env``).
+        Sampling is k=1 per call — the GRPO baseline comes from the K independent
+        episodes, exactly as the one-shot/joint groups get K candidates per state.
+        """
+        if self.cfg.snapshot_branching:
+            raise ValueError(
+                "snapshot_branching is incompatible with streaming_memory: streaming "
+                "branches the WHOLE episode per candidate, not one decision point. "
+                "Run with --no-snapshot-branching."
+            )
+        trajectories: List[Trajectory] = []
+        rewards: List[float] = []
+        for ci in range(self.cfg.group_size):
+            gen = worker.rollout_streaming(
+                state.episode_id, seed=group_seed, max_picks=self.cfg.streaming_max_picks,
+                buffer_reset=self.cfg.streaming_buffer_reset,
+                no_fifo=self.cfg.streaming_no_fifo,
+            )
+            traj: Trajectory = []
+            try:
+                dp = next(gen)
+                while isinstance(dp, DecisionPoint):
+                    cand = self.policy.sample_subgoals(
+                        key_frames=dp.key_frames,
+                        recent_frames=dp.recent_frames,
+                        task_goal=dp.task_goal,
+                        history_subgoals=dp.history_subgoals,
+                        k=1,
+                        max_new_tokens=self.cfg.max_new_tokens,
+                        temperature=self.cfg.sample_temperature,
+                        top_p=self.cfg.sample_top_p,
+                        has_video_demo=state.has_video_demo,
+                        debug=self.cfg.debug_subgoals,
+                        mode="use",   # the single MemER call — emits BOTH subtask + keyframe_positions
+                    )[0]
+                    traj.append(cand)
+                    if self.cfg.debug_subgoals:
+                        print(
+                            f"[grpo][debug] step={step} ep={state.episode_id} cand={ci} "
+                            f"pick={len(traj) - 1} ntok={cand.token_ids.numel()} "
+                            f"buf={len(dp.key_frames)} subtask={cand.subtask!r} "
+                            f"kf={cand.keyframe_positions}",
+                            flush=True,
+                        )
+                    dp = gen.send((cand.subtask, cand.keyframe_positions))
+                result = dp  # the generator's final yield is the RolloutResult
+            finally:
+                gen.close()
+            rewards.append(compute_reward(result.success_flag, result.progress, self.reward_cfg))
+            trajectories.append(traj)
         return trajectories, rewards
 
     # ------------------------------------------------------------------

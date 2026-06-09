@@ -30,6 +30,22 @@ SUBGOAL_SYSTEM_PROMPT = (
     "- keyframe_positions: list of frame positions (1-indexed) from the current input images where actions change"
 )
 
+# System prompt for the SELECT call of the joint select-then-use pipeline
+# (JOINT_MEMORY_DESIGN.md). DELIBERATELY DISTINCT from SUBGOAL_SYSTEM_PROMPT: the
+# two calls share near-identical IMAGE inputs, so if the prompts were also alike the
+# model collapses `keyframe_positions` to the majority target (`[]`, from USE rows)
+# and the SELECT head learns nothing. A separate system prompt + the mode="select"
+# user prompt + a SELECT target that carries ONLY keyframe_positions make the two
+# tasks unambiguous. See project_sft_plan_adjustments (the SELECT/USE schema fix).
+SELECT_SYSTEM_PROMPT = (
+    "You are a robot program with visual memory. You are shown the most recent frames the robot has executed. "
+    "Your job is to decide which of these frames are worth REMEMBERING as keyframes — frames that capture "
+    "information needed for later subtasks (for example, where an object is before it becomes hidden). "
+    "Output the keyframe positions and nothing else.\n\n"
+    "Return a JSON with:\n"
+    "- keyframe_positions: list of frame positions (1-indexed) from the current input images to remember"
+)
+
 
 def _wrap_images(n: int) -> str:
     """Render ``n`` ``<image>`` placeholders as MemER's bracketed list.
@@ -54,6 +70,7 @@ def build_user_prompt(
     n_recent_frames: int,
     history_subgoals: Optional[List[str]] = None,
     has_video_demo: bool = False,
+    mode: str = "use",
 ) -> str:
     """Build the MemER user-turn prompt (keyframes for memory + history for timing).
 
@@ -70,6 +87,11 @@ def build_user_prompt(
             prompt dropped it.
         has_video_demo: True when the task ships an initial-setup demo video; a
             ``<video>`` placeholder is prepended (the processor expands it).
+        mode: ``"use"`` (default) — predict the next subtask from past keyframes +
+            recent frames (the one-shot path AND the joint USE call); the returned
+            string is byte-identical to the original prompt. ``"select"`` — the
+            joint SELECT call: choose which of the recent frames to remember as
+            keyframes. The two modes MUST be distinct (see ``SELECT_SYSTEM_PROMPT``).
 
     Returns:
         The user-turn string. ``<image>`` / ``<video>`` placeholders are replaced
@@ -84,6 +106,17 @@ def build_user_prompt(
         if history_subgoals
         else ""
     )
+    if mode == "select":
+        # SELECT call: no past keyframes; pick which RECENT frames to remember.
+        return (
+            f"{video_prefix}The task goal is: {task_goal}\n"
+            f"{history_line}"
+            f"Here is current input image list from the front-view camera: {_wrap_images(n_recent_frames)}\n\n"
+            "Which of the current input frames should be remembered as keyframes for "
+            "later subtasks? Output only keyframe_positions."
+        )
+    if mode != "use":
+        raise ValueError(f"build_user_prompt: mode must be 'use' or 'select', got {mode!r}")
     return (
         f"{video_prefix}The task goal is: {task_goal}\n"
         f"{history_line}"
@@ -99,10 +132,17 @@ def build_messages(
     n_recent_frames: int,
     history_subgoals: Optional[List[str]] = None,
     has_video_demo: bool = False,
+    mode: str = "use",
 ) -> List[dict]:
-    """Build the OpenAI-style messages array (system + user turn)."""
+    """Build the OpenAI-style messages array (system + user turn).
+
+    ``mode`` selects the system prompt (``SELECT_SYSTEM_PROMPT`` for ``"select"``,
+    ``SUBGOAL_SYSTEM_PROMPT`` for ``"use"``) and the user-prompt variant — both must
+    match between the SFT builder and the rollout/trainer (the prompt-parity invariant).
+    """
+    system = SELECT_SYSTEM_PROMPT if mode == "select" else SUBGOAL_SYSTEM_PROMPT
     return [
-        {"role": "system", "content": SUBGOAL_SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": build_user_prompt(
@@ -111,6 +151,7 @@ def build_messages(
                 n_recent_frames=n_recent_frames,
                 history_subgoals=history_subgoals,
                 has_video_demo=has_video_demo,
+                mode=mode,
             ),
         },
     ]
@@ -175,6 +216,7 @@ def parse_subgoal_output(text: str) -> Tuple[str, List[int]]:
 
 __all__ = [
     "SUBGOAL_SYSTEM_PROMPT",
+    "SELECT_SYSTEM_PROMPT",
     "build_user_prompt",
     "build_messages",
     "parse_subgoal_output",

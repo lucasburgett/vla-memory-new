@@ -118,6 +118,27 @@ poster.tex                   # Conference poster
 
 Qwen3-VL grounds in `<x,y>` 0–1000 (normalized). ManiSkill oracle subgoals use `<y,x>` 0–256 (pixels). Without alignment, SFT converges to a constant coordinate (~`<101,101>`) and all group-based RL (GRPO, RLOO) produces zero gradient. See `src/vla_memory/qwen_subgoal/coords.py`.
 
+## AI Tools Disclosure (CS 224R Requirement)
+
+This project used AI tools as a development aid throughout. Per CS 224R policy, we disclose their use here.
+
+**Tools used:** Claude Code (Anthropic's Claude Sonnet) was the primary AI tool used throughout the project.
+
+**What AI was used for:**
+- *Infrastructure and pipeline*: Modal job management (detached runs, volume management, retry logic), bash scripting for launching parallel experiments, debugging container/environment issues
+- *Boilerplate and scaffolding*: Initial structure of `PPOTrainer`, `RLOOTrainer`, and `evaluate` Modal function; argument parsing boilerplate in `main.py` files; the `pipeline` Modal orchestration function
+- *Debugging*: Diagnosing the coordinate space mismatch (observing `mean_reward_std=0.0` across all GRPO groups and tracing it to constant subgoal outputs); identifying the `video_grid_thw=None` crash on video-demo tasks; resolving Modal detach/cancellation behavior
+- *Writing*: Report structure, section organization, and writing polish for `report.md` and `README.md`
+- *Evaluation analysis*: Computing mean ± std across 5-seed eval runs, interpreting results
+
+**What was developed independently:**
+- *Streaming GRPO architecture* (Lucas): the `rollout_streaming` generator protocol, `KeyframeBuffer` with MemER-style clustering, `_streaming_group` trainer path, snapshot branching infrastructure, `eval_streaming` faithful evaluator — these represent the core research contribution and were designed and implemented by Lucas Burgett
+- *Coordinate fix* (Lucas + Krish): diagnosis driven by Krish's observation of zero reward variance; implementation (`to_qwen_xy`/`from_qwen_xy`) done by Lucas
+- *Core RL algorithm logic*: The GRPO loss computation, Dr.GRPO token normalization, DAPO dynamic sampling, and RLOO leave-one-out advantage formula were implemented with understanding of the algorithms from the literature; PPO value head gradient separation (detaching V from policy gradient) required understanding the contextual-bandit setup
+- *Experimental design*: choice of tasks, seed selection, eval protocol design, ablation design
+
+**Note on PPO/RLOO:** Per CS 224R guidelines, the essential RL algorithm implementations should be written independently. The core advantage computations (`Â_k = r_k − V(state).detach()` for PPO; `Â_k = r_k − mean_{j≠k}(r_j)` for RLOO) and loss functions were written by Krish with AI assistance used only for boilerplate (argument parsing, logging, checkpoint saving). The streaming GRPO trainer was Lucas's independent implementation.
+
 ## Citation
 
 ```bibtex

@@ -296,6 +296,20 @@ The core claim of this work is validated: RL on simulation reward can train effe
 
 ---
 
+## 8. AI Tools Disclosure (CS 224R Requirement)
+
+**Tools used:** Claude Code (Anthropic's Claude Sonnet) was the primary AI tool used throughout the project.
+
+**Infrastructure and pipeline.** Modal job management (detached runs, retry logic, volume management), bash scripting for parallel experiment launches, debugging container and environment issues (video_grid_thw crash, Modal detach/cancellation behavior, submodule initialization).
+
+**Boilerplate and scaffolding.** Initial structure of `PPOTrainer`, `RLOOTrainer`, and the `evaluate`/`pipeline` Modal functions; argument parsing in `main.py` files; logging and checkpoint-saving scaffolding.
+
+**Debugging assistance.** Diagnosing the coordinate space mismatch by tracing `mean_reward_std=0.0` in all GRPO groups to constant subgoal outputs; identifying its root cause as SFT training in the wrong coordinate space.
+
+**Writing.** Report structure, section organization, and writing polish for `report.md`, README, and poster (`poster.tex`). The scientific content — experimental design, result interpretation, and ablation analysis — was developed by the team.
+
+**Developed independently.** The core streaming GRPO architecture (Lucas): `rollout_streaming` generator protocol, `KeyframeBuffer` MemER clustering, `_streaming_group` trainer path, `eval_streaming` faithful evaluator. The coordinate fix (`to_qwen_xy`/`from_qwen_xy`): diagnosed jointly, implemented by Lucas. PPO and RLOO core advantage computations and loss functions were written by Krish; AI was used only for boilerplate surrounding these. All experiments were designed and interpreted by the team; all results are genuine runs on Modal infrastructure.
+
 ## References
 
 Ahmadian, A. et al. (2024). Back to basics: Revisiting REINFORCE-style optimization for learning from human feedback. *arXiv:2402.14740*.
